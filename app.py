@@ -792,11 +792,30 @@ def page_analytics():
         {"s": s5, "e": e5},
     )
 
+    # Build a stable frame that always has the expected columns,
+    # even when there are no DB rows for the previous 5 business days.
     frame = pd.DataFrame({"entry_date": biz_days})
+    frame["total_actual"] = 0  # prevents KeyError if df_5 is empty
+
     if not df_5.empty:
         df_5["entry_date"] = pd.to_datetime(df_5["entry_date"]).dt.date
-        frame = frame.merge(df_5, on="entry_date", how="left")
-    frame["total_actual"] = frame["total_actual"].fillna(0).astype(int)
+
+        # Ensure the aggregate column exists (and is numeric-ish) before merging
+        if "total_actual" not in df_5.columns:
+            df_5["total_actual"] = 0
+
+        frame = frame.merge(df_5[["entry_date", "total_actual"]], on="entry_date", how="left")
+
+        # If a merge ever introduces suffixes, recover gracefully
+        if "total_actual" not in frame.columns:
+            if "total_actual_x" in frame.columns:
+                frame["total_actual"] = frame["total_actual_x"]
+            elif "total_actual_y" in frame.columns:
+                frame["total_actual"] = frame["total_actual_y"]
+            else:
+                frame["total_actual"] = 0
+
+    frame["total_actual"] = pd.to_numeric(frame["total_actual"], errors="coerce").fillna(0).astype(int)
 
     fig1 = px.line(frame, x="entry_date", y="total_actual", markers=True)
     fig1.update_layout(xaxis_title="Day", yaxis_title="Pieces")
