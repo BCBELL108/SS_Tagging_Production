@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 import plotly.express as px
 
 # =============================================================================
@@ -23,7 +23,7 @@ LOGO_CANDIDATES = [
 # Work types (rates are internal only; not shown in UI)
 WORK_TYPES = ["Tags", "Stickers", "Picking", "VAS"]
 
-# Internal production rates (per 8-hour shift) - NEVER displayed
+# Internal production rates (per 8-hour shift) - NOT displayed in UI
 TAG_RATES_PER_DAY = {
     "Del Sol": 800,
     "Cariloha": 500,
@@ -285,11 +285,18 @@ CUSTOMER_SEED = [
 # =============================================================================
 @st.cache_resource
 def get_engine():
+    # expects:
+    # [connections.db]
+    # url = "postgresql://..."
     return create_engine(st.secrets["connections"]["db"]["url"], pool_pre_ping=True)
 
-def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+def fetch_df(sql, params: dict | None = None) -> pd.DataFrame:
+    """Accepts either a SQL string or a SQLAlchemy TextClause."""
     with get_engine().begin() as conn:
-        res = conn.execute(text(sql), params or {})
+        if isinstance(sql, str):
+            res = conn.execute(text(sql), params or {})
+        else:
+            res = conn.execute(sql, params or {})
         rows = res.mappings().all()
     return pd.DataFrame(rows)
 
@@ -358,8 +365,10 @@ def init_db():
     """)
 
 def seed_employees():
+    # seed only if employees is empty
     if not fetch_df("SELECT 1 FROM employees LIMIT 1;").empty:
         return
+
     batch = [{"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]} for r in EMPLOYEE_SEED]
     with get_engine().begin() as conn:
         conn.execute(
@@ -372,11 +381,13 @@ def seed_employees():
         )
 
 def seed_customers():
+    # ensure all customers exist (idempotent)
     existing = fetch_df("SELECT customer_name FROM customers;")
     existing_set = set(existing["customer_name"].tolist()) if not existing.empty else set()
     missing = [name for name in CUSTOMER_SEED if name not in existing_set]
     if not missing:
         return
+
     batch = [{"id": str(uuid.uuid4()), "name": n} for n in missing]
     with get_engine().begin() as conn:
         conn.execute(
@@ -510,7 +521,8 @@ def page_submissions():
             "work_type": "Tags",
             "customer": customer_list[0],
             "hours": 8.0,
-            "actual": 0,  # do not suggest
+            "actual": 0,
+            "notes": "",
         }]
 
     def add_row():
@@ -521,7 +533,8 @@ def page_submissions():
             "work_type": last["work_type"],
             "customer": last["customer"],
             "hours": 4.0,
-            "actual": 0,  # do not suggest
+            "actual": 0,
+            "notes": "",
         })
 
     def remove_row(i: int):
@@ -532,7 +545,6 @@ def page_submissions():
     for i, row in enumerate(st.session_state.draft_rows):
         c1, c2, c3, c4, c5 = st.columns([1.35, 1.7, 1.3, 2.0, 1.0])
 
-        # Calendar + forced format
         row["entry_date"] = c1.date_input(
             "Date",
             value=row["entry_date"],
@@ -585,6 +597,12 @@ def page_submissions():
             key=f"a_{i}",
         )
 
+        row["notes"] = st.text_input(
+            "Notes (optional)",
+            value=row.get("notes", ""),
+            key=f"n_{i}",
+        )
+
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
 
@@ -611,13 +629,12 @@ def page_submissions():
             st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
-        # Safer insert: row-by-row in one transaction, and pass real UUID objects
         insert_sql = text("""
             INSERT INTO production_entries
               (entry_id, entry_date, employee_id, customer_name, work_type,
                hours_worked, actual_qty, expected_qty, notes)
             VALUES
-              (:id, :d, :eid, :c, :wt, :h, :a, :e, NULL)
+              (:id, :d, :eid, :c, :wt, :h, :a, :e, :n)
         """)
 
         with get_engine().begin() as conn:
@@ -632,6 +649,7 @@ def page_submissions():
                     "h": float(r["hours"]),
                     "a": int(r["actual"]),
                     "e": int(exp),
+                    "n": r["notes"].strip() if r.get("notes") else None,
                 }
                 conn.execute(insert_sql, params)
 
@@ -643,6 +661,7 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": 0,
+            "notes": "",
         }]
         st.rerun()
 
@@ -664,8 +683,8 @@ def page_analytics():
         st.info("Select at least one work type.")
         return
 
-    df = fetch_df(
-        """
+    # IMPORTANT: use expanding bindparam for IN (...) list
+    sql = text("""
         SELECT
           pe.entry_date,
           e.first_name || ' ' || e.last_name AS employee,
@@ -676,9 +695,12 @@ def page_analytics():
         FROM production_entries pe
         JOIN employees e ON e.employee_id = pe.employee_id
         WHERE pe.entry_date BETWEEN :s AND :e
-          AND pe.work_type = ANY(:types)
+          AND pe.work_type IN :types
           AND lower(e.first_name || ' ' || e.last_name) <> :hide_name
-        """,
+    """).bindparams(bindparam("types", expanding=True))
+
+    df = fetch_df(
+        sql,
         {"s": start, "e": end, "types": type_filter, "hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
     )
 
@@ -774,6 +796,7 @@ def page_employees():
         """,
         {"hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
     )
+
     st.dataframe(emp[["first_name", "last_name", "is_active"]], use_container_width=True, hide_index=True)
 
     st.markdown("---")
@@ -813,6 +836,113 @@ def page_employees():
             for r in emp.itertuples(index=False)
         ]
         pick = st.selectbox("Select employee", labels, key="emp_pick")
+
         selected = emp.iloc[labels.index(pick)]
+        emp_id = selected["employee_id"]
+        is_active = bool(selected["is_active"])
+        btn = "Deactivate" if is_active else "Reactivate"
+
+        if st.button(btn, use_container_width=True):
+            exec_sql(
+                """
+                UPDATE employees
+                SET is_active = :new_state,
+                    updated_at = now()
+                WHERE employee_id = :id::uuid
+                """,
+                {"new_state": (not is_active), "id": emp_id},
+            )
+            get_active_employees_df.clear()
+            st.success("Updated ✅")
+            st.rerun()
+
+def page_customers():
+    st.title("Customers")
+    st.write("All customers are seeded automatically. You can add more, or deactivate/reactivate existing ones.")
+
+    cust = fetch_df(
+        """
+        SELECT customer_id::text AS customer_id, customer_name, is_active
+        FROM customers
+        ORDER BY is_active DESC,
+          CASE
+            WHEN customer_name = 'Del Sol' THEN 1
+            WHEN customer_name = 'Cariloha' THEN 2
+            WHEN customer_name LIKE 'Purpose%' THEN 3
+            WHEN customer_name = :internal THEN 98
+            ELSE 99
+          END,
+          customer_name
+        """,
+        {"internal": INTERNAL_CUSTOMER_NAME},
+    )
+
+    st.dataframe(cust[["customer_name", "is_active"]], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.subheader("Add customer")
+        name = st.text_input("Customer name", key="cust_name")
+        if st.button("➕ Add customer"):
+            nm = name.strip()
+            if not nm:
+                st.error("Enter a customer name.")
+            else:
+                exec_sql(
+                    """
+                    INSERT INTO customers (customer_id, customer_name, is_active)
+                    VALUES (:id, :name, TRUE)
+                    ON CONFLICT (customer_name) DO NOTHING
+                    """,
+                    {"id": str(uuid.uuid4()), "name": nm},
+                )
+                get_active_customers_df.clear()
+                st.success("Saved ✅")
+                st.rerun()
+
+    with colB:
+        st.subheader("Deactivate / Reactivate")
+        if cust.empty:
+            st.info("No customers available.")
+            return
+
+        labels = [f"{r.customer_name} ({'Active' if r.is_active else 'Inactive'})" for r in cust.itertuples(index=False)]
+        pick = st.selectbox("Select customer", labels, key="cust_pick")
+        selected = cust.iloc[labels.index(pick)]
         new_state = not bool(selected["is_active"])
-        btn = "Deactivate" if selected["is_active"] else "React_]()
+        btn = "Deactivate" if selected["is_active"] else "Reactivate"
+        if st.button(btn, use_container_width=True):
+            exec_sql(
+                """
+                UPDATE customers
+                SET is_active = :s, updated_at = NOW()
+                WHERE customer_id = :id::uuid
+                """,
+                {"s": new_state, "id": selected["customer_id"]},
+            )
+            get_active_customers_df.clear()
+            st.success("Updated ✅")
+            st.rerun()
+
+# =============================================================================
+# MAIN
+# =============================================================================
+st.title(APP_TITLE)
+
+try:
+    boot()
+except Exception as e:
+    st.error(f"Database init failed: {e}")
+    st.stop()
+
+page = sidebar()
+if page == "Submissions":
+    page_submissions()
+elif page == "Analytics":
+    page_analytics()
+elif page == "Employees":
+    page_employees()
+else:
+    page_customers()
