@@ -18,7 +18,7 @@ LOGO_CANDIDATES = [
     "silverscreen_logo.PNG",
 ]
 
-# Work types + rates (per 8-hour shift)
+# Work types (rates are internal only; not shown in UI)
 WORK_TYPES = ["Tags", "Stickers", "Picking", "VAS"]
 
 TAG_RATES_PER_DAY = {
@@ -38,7 +38,10 @@ VAS_RATE_PER_DAY = 400
 
 INTERNAL_CUSTOMER_NAME = "Internal (Picking/VAS)"
 
-# Employees to seed
+# Always hide Brandon Bell in UI (even if present in DB)
+HIDE_EMPLOYEE_FULLNAME_LOWER = "brandon bell"
+
+# Employees to seed (does NOT include Brandon Bell)
 EMPLOYEE_SEED = [
     {"first_name": "Yesenia", "last_name": "Alcala villa"},
     {"first_name": "Andie", "last_name": "Dunsmore"},
@@ -54,7 +57,7 @@ EMPLOYEE_SEED = [
     {"first_name": "Steve", "last_name": "Zenz"},
 ]
 
-# FULL customer list you provided + internal customer
+# FULL customer list + internal customer
 CUSTOMER_SEED = [
     INTERNAL_CUSTOMER_NAME,
     "2469 - The UPS Store",
@@ -354,29 +357,40 @@ def init_db():
     """)
 
 def seed_employees():
-    # seed only if employees is empty
+    # Seed only if employees is empty
     if not fetch_df("SELECT 1 FROM employees LIMIT 1;").empty:
         return
-    for r in EMPLOYEE_SEED:
-        exec_sql(
-            """
-            INSERT INTO employees (employee_id, first_name, last_name, is_active)
-            VALUES (:id, :fn, :ln, TRUE)
-            ON CONFLICT DO NOTHING
-            """,
-            {"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]},
+
+    batch = [{"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]} for r in EMPLOYEE_SEED]
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO employees (employee_id, first_name, last_name, is_active)
+                VALUES (:id, :fn, :ln, TRUE)
+                ON CONFLICT DO NOTHING
+            """),
+            batch,
         )
 
 def seed_customers():
-    # ALWAYS ensure all customers exist (idempotent)
-    for name in CUSTOMER_SEED:
-        exec_sql(
-            """
-            INSERT INTO customers (customer_id, customer_name, is_active)
-            VALUES (:id, :name, TRUE)
-            ON CONFLICT (customer_name) DO NOTHING
-            """,
-            {"id": str(uuid.uuid4()), "name": name},
+    # Bulk-insert customers once; only fill missing names.
+    # This avoids hundreds of round-trips every app rerun.
+    existing = fetch_df("SELECT customer_name FROM customers;")
+    existing_set = set(existing["customer_name"].tolist()) if not existing.empty else set()
+
+    missing = [name for name in CUSTOMER_SEED if name not in existing_set]
+    if not missing:
+        return
+
+    batch = [{"id": str(uuid.uuid4()), "name": n} for n in missing]
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO customers (customer_id, customer_name, is_active)
+                VALUES (:id, :name, TRUE)
+                ON CONFLICT (customer_name) DO NOTHING
+            """),
+            batch,
         )
 
 def boot():
@@ -400,11 +414,10 @@ def sidebar():
             st.image(logo, use_container_width=True)
         st.markdown("---")
         page = st.radio("Navigate", ["Submissions", "Analytics", "Employees", "Customers"], label_visibility="collapsed")
-        st.markdown("---")
-        st.caption("Rates (per 8 hrs): Tags varies • Stickers 2400 • Picking 3000 • VAS 400")
     return page
 
 def expected_qty(customer: str, work_type: str, hours: float) -> int:
+    # Internal-only: used for expected_qty storage and analytics efficiency calculations
     if work_type == "Tags":
         rate = TAG_RATES_PER_DAY.get(customer, DEFAULT_TAG_RATE_PER_DAY)
     elif work_type == "Stickers":
@@ -434,18 +447,24 @@ def week_start_monday(d: date) -> date:
 # =============================================================================
 # PAGES
 # =============================================================================
-def page_submissions():
-    st.title("Submissions")
-    st.write("Log a shift (or partial shift). Add multiple lines for split shifts.")
-
-    emp_df = fetch_df("""
+@st.cache_data(ttl=30)
+def get_active_employees_df():
+    # Exclude Brandon Bell no matter what’s in the DB
+    return fetch_df(
+        """
         SELECT employee_id::text AS employee_id, first_name, last_name
         FROM employees
         WHERE is_active = TRUE
+          AND lower(first_name || ' ' || last_name) <> :hide_name
         ORDER BY first_name, last_name
-    """)
+        """,
+        {"hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
+    )
 
-    cust_df = fetch_df("""
+@st.cache_data(ttl=60)
+def get_active_customers_df():
+    return fetch_df(
+        """
         SELECT customer_name
         FROM customers
         WHERE is_active = TRUE
@@ -458,7 +477,16 @@ def page_submissions():
             ELSE 99
           END,
           customer_name
-    """, {"internal": INTERNAL_CUSTOMER_NAME})
+        """,
+        {"internal": INTERNAL_CUSTOMER_NAME},
+    )
+
+def page_submissions():
+    st.title("Submissions")
+    st.write("Log a shift (or partial shift). Use “Add another submission” for split shifts.")
+
+    emp_df = get_active_employees_df()
+    cust_df = get_active_customers_df()
 
     if emp_df.empty:
         st.error("No active employees. Add employees in the Employees page.")
@@ -479,7 +507,6 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": None,
-            "notes": "",
         }]
 
     def add_row():
@@ -491,7 +518,6 @@ def page_submissions():
             "customer": last["customer"],
             "hours": 4.0,
             "actual": None,
-            "notes": "",
         })
 
     def remove_row(i: int):
@@ -499,8 +525,8 @@ def page_submissions():
             return
         st.session_state.draft_rows.pop(i)
 
+    # No "Entry 1" headings — just clean blocks
     for i, row in enumerate(st.session_state.draft_rows):
-        st.markdown(f"### Entry {i+1}")
         c1, c2, c3, c4, c5 = st.columns([1.1, 1.7, 1.3, 2.0, 1.2])
 
         row["entry_date"] = c1.date_input("Date", value=row["entry_date"], key=f"d_{i}")
@@ -519,21 +545,15 @@ def page_submissions():
 
         exp = expected_qty(row["customer"], row["work_type"], float(row["hours"]))
         default_actual = exp if row["actual"] is None else int(row["actual"])
-
         row["actual"] = st.number_input("Actual pieces completed", min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
-        row["notes"] = st.text_input("Notes (optional)", value=row.get("notes", ""), key=f"n_{i}")
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
 
-        eff = (row["actual"] / exp * 100.0) if exp > 0 else 0.0
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Expected (prorated)", f"{exp:,}")
-        k2.metric("Actual", f"{int(row['actual']):,}")
-        k3.metric("Efficiency", f"{eff:.0f}%")
+        # No expected/efficiency metrics shown (rates stay hidden)
 
         if len(st.session_state.draft_rows) > 1:
-            if st.button("🗑️ Remove this entry", key=f"rm_{i}"):
+            if st.button("🗑️ Remove", key=f"rm_{i}"):
                 remove_row(i)
                 st.rerun()
 
@@ -544,28 +564,23 @@ def page_submissions():
         add_row()
         st.rerun()
 
-    if b2.button("✅ Save ALL entries", use_container_width=True):
+    if b2.button("✅ Save ALL submissions", use_container_width=True):
         errors = []
         for idx, r in enumerate(st.session_state.draft_rows, start=1):
             if float(r["hours"]) <= 0:
-                errors.append(f"Entry {idx}: Hours must be > 0.")
+                errors.append(f"Submission {idx}: Hours must be > 0.")
             if r["work_type"] == "Stickers" and r["customer"] not in STICKER_ALLOWED_CUSTOMERS:
-                errors.append(f"Entry {idx}: Stickers only allowed for Del Sol and Cariloha.")
+                errors.append(f"Submission {idx}: Stickers only allowed for Del Sol and Cariloha.")
         if errors:
             st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
-        for r in st.session_state.draft_rows:
-            exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
-            exec_sql(
-                """
-                INSERT INTO production_entries
-                  (entry_id, entry_date, employee_id, customer_name, work_type,
-                   hours_worked, actual_qty, expected_qty, notes)
-                VALUES
-                  (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, :n)
-                """,
-                {
+        # Insert without notes (kept as NULL)
+        with get_engine().begin() as conn:
+            batch = []
+            for r in st.session_state.draft_rows:
+                exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
+                batch.append({
                     "id": str(uuid.uuid4()),
                     "d": r["entry_date"],
                     "eid": emp_label_to_id[r["employee_label"]],
@@ -574,8 +589,17 @@ def page_submissions():
                     "h": float(r["hours"]),
                     "a": int(r["actual"]),
                     "e": int(exp),
-                    "n": r["notes"].strip() if r.get("notes") else None,
-                },
+                })
+
+            conn.execute(
+                text("""
+                    INSERT INTO production_entries
+                      (entry_id, entry_date, employee_id, customer_name, work_type,
+                       hours_worked, actual_qty, expected_qty, notes)
+                    VALUES
+                      (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, NULL)
+                """),
+                batch
             )
 
         st.success("Saved ✅")
@@ -586,7 +610,6 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": None,
-            "notes": "",
         }]
         st.rerun()
 
@@ -624,27 +647,29 @@ def page_analytics():
         JOIN employees e ON e.employee_id = pe.employee_id
         WHERE pe.entry_date BETWEEN :s AND :e
           AND pe.work_type = ANY(:types)
+          AND lower(e.first_name || ' ' || e.last_name) <> :hide_name
         """,
-        {"s": start, "e": end, "types": type_filter},
+        {"s": start, "e": end, "types": type_filter, "hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
     )
 
     if df.empty:
         st.info("No data for the selected range.")
         return
 
+    # Intuitive top-level KPIs (these are ok; they don’t expose the raw rates)
     total_actual = int(df["actual_qty"].sum())
     total_expected = int(df["expected_qty"].sum())
     eff = (total_actual / total_expected * 100.0) if total_expected else 0.0
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Actual (pieces)", f"{total_actual:,}")
-    k2.metric("Expected (pieces)", f"{total_expected:,}")
+    k1.metric("Total Pieces", f"{total_actual:,}")
+    k2.metric("Total Expected", f"{total_expected:,}")
     k3.metric("Efficiency", f"{eff:.0f}%")
-    k4.metric("Entries", f"{len(df):,}")
+    k4.metric("Submissions", f"{len(df):,}")
 
     st.markdown("---")
 
-    # 1) Team totals for previous 5 business days (all types)
+    # 1) Team totals for previous 5 business days
     st.subheader("Team total production — previous 5 business days")
     biz_days = previous_business_days(5, today)
     s5, e5 = biz_days[0], biz_days[-1]
@@ -667,7 +692,7 @@ def page_analytics():
     frame["total_actual"] = frame["total_actual"].fillna(0).astype(int)
 
     fig1 = px.line(frame, x="entry_date", y="total_actual", markers=True)
-    fig1.update_layout(xaxis_title="Day", yaxis_title="Total pieces (all work)")
+    fig1.update_layout(xaxis_title="Day", yaxis_title="Pieces")
     st.plotly_chart(fig1, use_container_width=True)
 
     # 2) Month-to-date weekly totals (each week is a point)
@@ -692,36 +717,37 @@ def page_analytics():
         weekly = df_m.groupby("week_start", as_index=False)["total_actual"].sum().sort_values("week_start")
 
         fig2 = px.line(weekly, x="week_start", y="total_actual", markers=True)
-        fig2.update_layout(xaxis_title="Week (Mon start)", yaxis_title="Total pieces (week)")
+        fig2.update_layout(xaxis_title="Week (Mon start)", yaxis_title="Pieces")
         st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("---")
 
     # 3) Employee bars by work type (selected range)
-    st.subheader("Employee output by work type (selected date range)")
+    st.subheader("Employee output by work type (selected range)")
     by_emp = df.groupby(["work_type", "employee"], as_index=False)["actual_qty"].sum()
     by_emp = by_emp.sort_values(["work_type", "actual_qty"], ascending=[True, False])
 
     for wt in WORK_TYPES:
         sub = by_emp[by_emp["work_type"] == wt]
         if sub.empty:
-            st.caption(f"No {wt} entries in this range.")
+            st.caption(f"No {wt} in this range.")
             continue
         fig = px.bar(sub, x="employee", y="actual_qty")
         fig.update_layout(title=f"{wt} — pieces by employee", xaxis_title="", yaxis_title="Pieces")
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Detail table (selected range)")
-    st.dataframe(by_emp, use_container_width=True, hide_index=True)
-
 def page_employees():
     st.title("Employees")
 
-    emp = fetch_df("""
+    emp = fetch_df(
+        """
         SELECT employee_id::text AS employee_id, first_name, last_name, is_active
         FROM employees
+        WHERE lower(first_name || ' ' || last_name) <> :hide_name
         ORDER BY is_active DESC, first_name, last_name
-    """)
+        """,
+        {"hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
+    )
     st.dataframe(emp[["first_name", "last_name", "is_active"]], use_container_width=True, hide_index=True)
 
     st.markdown("---")
@@ -732,8 +758,11 @@ def page_employees():
         fn = st.text_input("First name", key="emp_fn")
         ln = st.text_input("Last name", key="emp_ln")
         if st.button("➕ Add employee"):
-            if not fn.strip() or not ln.strip():
+            fn2, ln2 = fn.strip(), ln.strip()
+            if not fn2 or not ln2:
                 st.error("Enter both first and last name.")
+            elif f"{fn2} {ln2}".strip().lower() == HIDE_EMPLOYEE_FULLNAME_LOWER:
+                st.error("That employee is hidden from this app.")
             else:
                 exec_sql(
                     """
@@ -741,13 +770,18 @@ def page_employees():
                     VALUES (:id, :fn, :ln, TRUE)
                     ON CONFLICT DO NOTHING
                     """,
-                    {"id": str(uuid.uuid4()), "fn": fn.strip(), "ln": ln.strip()},
+                    {"id": str(uuid.uuid4()), "fn": fn2, "ln": ln2},
                 )
+                get_active_employees_df.clear()
                 st.success("Added ✅")
                 st.rerun()
 
     with colB:
         st.subheader("Deactivate / Reactivate")
+        if emp.empty:
+            st.info("No employees available.")
+            return
+
         labels = [
             f"{r.first_name} {r.last_name} ({'Active' if r.is_active else 'Inactive'})"
             for r in emp.itertuples(index=False)
@@ -765,14 +799,15 @@ def page_employees():
                 """,
                 {"s": new_state, "id": selected["employee_id"]},
             )
+            get_active_employees_df.clear()
             st.success("Updated ✅")
             st.rerun()
 
 def page_customers():
     st.title("Customers")
-    st.write("All customers are seeded automatically. You can add more, or deactivate/reactivate existing ones.")
 
-    cust = fetch_df("""
+    cust = fetch_df(
+        """
         SELECT customer_id::text AS customer_id, customer_name, is_active
         FROM customers
         ORDER BY is_active DESC,
@@ -784,7 +819,9 @@ def page_customers():
             ELSE 99
           END,
           customer_name
-    """, {"internal": INTERNAL_CUSTOMER_NAME})
+        """,
+        {"internal": INTERNAL_CUSTOMER_NAME},
+    )
 
     st.dataframe(cust[["customer_name", "is_active"]], use_container_width=True, hide_index=True)
 
@@ -807,11 +844,16 @@ def page_customers():
                     """,
                     {"id": str(uuid.uuid4()), "name": nm},
                 )
+                get_active_customers_df.clear()
                 st.success("Saved ✅")
                 st.rerun()
 
     with colB:
         st.subheader("Deactivate / Reactivate")
+        if cust.empty:
+            st.info("No customers available.")
+            return
+
         labels = [f"{r.customer_name} ({'Active' if r.is_active else 'Inactive'})" for r in cust.itertuples(index=False)]
         pick = st.selectbox("Select customer", labels, key="cust_pick")
         selected = cust.iloc[labels.index(pick)]
@@ -826,6 +868,7 @@ def page_customers():
                 """,
                 {"s": new_state, "id": selected["customer_id"]},
             )
+            get_active_customers_df.clear()
             st.success("Updated ✅")
             st.rerun()
 
