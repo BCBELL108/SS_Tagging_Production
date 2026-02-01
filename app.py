@@ -38,7 +38,7 @@ VAS_RATE_PER_DAY = 400
 
 INTERNAL_CUSTOMER_NAME = "Internal (Picking/VAS)"
 
-# Employees to seed (EXCLUDES Brandon Bell per your request)
+# Employees to seed
 EMPLOYEE_SEED = [
     {"first_name": "Yesenia", "last_name": "Alcala villa"},
     {"first_name": "Andie", "last_name": "Dunsmore"},
