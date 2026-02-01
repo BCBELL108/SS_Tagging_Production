@@ -357,7 +357,6 @@ def init_db():
     """)
 
 def seed_employees():
-    # Seed only if employees is empty
     if not fetch_df("SELECT 1 FROM employees LIMIT 1;").empty:
         return
 
@@ -373,8 +372,6 @@ def seed_employees():
         )
 
 def seed_customers():
-    # Bulk-insert customers once; only fill missing names.
-    # This avoids hundreds of round-trips every app rerun.
     existing = fetch_df("SELECT customer_name FROM customers;")
     existing_set = set(existing["customer_name"].tolist()) if not existing.empty else set()
 
@@ -417,7 +414,6 @@ def sidebar():
     return page
 
 def expected_qty(customer: str, work_type: str, hours: float) -> int:
-    # Internal-only: used for expected_qty storage and analytics efficiency calculations
     if work_type == "Tags":
         rate = TAG_RATES_PER_DAY.get(customer, DEFAULT_TAG_RATE_PER_DAY)
     elif work_type == "Stickers":
@@ -444,12 +440,19 @@ def month_start(d: date) -> date:
 def week_start_monday(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
+def actual_label_for(work_type: str) -> str:
+    return {
+        "Tags": "Pieces tagged",
+        "Stickers": "Stickers adhered",
+        "Picking": "Pieces picked",
+        "VAS": "Pieces processed (VAS)",
+    }.get(work_type, "Actual pieces completed")
+
 # =============================================================================
 # PAGES
 # =============================================================================
 @st.cache_data(ttl=30)
 def get_active_employees_df():
-    # Exclude Brandon Bell no matter what’s in the DB
     return fetch_df(
         """
         SELECT employee_id::text AS employee_id, first_name, last_name
@@ -483,7 +486,7 @@ def get_active_customers_df():
 
 def page_submissions():
     st.title("Submissions")
-    st.write("Log a shift (or partial shift). Use “Add another submission” for split shifts.")
+    st.write('Log a shift (or partial shift). Use "Add another submission" for split shifts.')
 
     emp_df = get_active_employees_df()
     cust_df = get_active_customers_df()
@@ -506,18 +509,19 @@ def page_submissions():
             "work_type": "Tags",
             "customer": customer_list[0],
             "hours": 8.0,
-            "actual": None,
+            "actual": 0,
         }]
 
     def add_row():
+        # Keep the SAME employee + date automatically (your request)
         last = st.session_state.draft_rows[-1]
         st.session_state.draft_rows.append({
             "entry_date": last["entry_date"],
-            "employee_label": last["employee_label"],
+            "employee_label": last["employee_label"],  # assume same person
             "work_type": last["work_type"],
             "customer": last["customer"],
             "hours": 4.0,
-            "actual": None,
+            "actual": 0,  # do NOT suggest output
         })
 
     def remove_row(i: int):
@@ -525,7 +529,6 @@ def page_submissions():
             return
         st.session_state.draft_rows.pop(i)
 
-    # No "Entry 1" headings — just clean blocks
     for i, row in enumerate(st.session_state.draft_rows):
         c1, c2, c3, c4, c5 = st.columns([1.1, 1.7, 1.3, 2.0, 1.2])
 
@@ -543,14 +546,18 @@ def page_submissions():
 
         row["hours"] = c5.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours"]), step=0.25, key=f"h_{i}")
 
-        exp = expected_qty(row["customer"], row["work_type"], float(row["hours"]))
-        default_actual = exp if row["actual"] is None else int(row["actual"])
-        row["actual"] = st.number_input("Actual pieces completed", min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
+        # Work-type specific label + no suggested value
+        label = actual_label_for(row["work_type"])
+        row["actual"] = st.number_input(
+            label,
+            min_value=0,
+            value=int(row.get("actual", 0)),
+            step=10,
+            key=f"a_{i}"
+        )
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
-
-        # No expected/efficiency metrics shown (rates stay hidden)
 
         if len(st.session_state.draft_rows) > 1:
             if st.button("🗑️ Remove", key=f"rm_{i}"):
@@ -575,7 +582,6 @@ def page_submissions():
             st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
-        # Insert without notes (kept as NULL)
         with get_engine().begin() as conn:
             batch = []
             for r in st.session_state.draft_rows:
@@ -609,7 +615,7 @@ def page_submissions():
             "work_type": "Tags",
             "customer": customer_list[0],
             "hours": 8.0,
-            "actual": None,
+            "actual": 0,
         }]
         st.rerun()
 
@@ -656,7 +662,6 @@ def page_analytics():
         st.info("No data for the selected range.")
         return
 
-    # Intuitive top-level KPIs (these are ok; they don’t expose the raw rates)
     total_actual = int(df["actual_qty"].sum())
     total_expected = int(df["expected_qty"].sum())
     eff = (total_actual / total_expected * 100.0) if total_expected else 0.0
@@ -669,7 +674,6 @@ def page_analytics():
 
     st.markdown("---")
 
-    # 1) Team totals for previous 5 business days
     st.subheader("Team total production — previous 5 business days")
     biz_days = previous_business_days(5, today)
     s5, e5 = biz_days[0], biz_days[-1]
@@ -695,7 +699,6 @@ def page_analytics():
     fig1.update_layout(xaxis_title="Day", yaxis_title="Pieces")
     st.plotly_chart(fig1, use_container_width=True)
 
-    # 2) Month-to-date weekly totals (each week is a point)
     st.subheader("Monthly total production — weekly points (month-to-date)")
     m_start = month_start(today)
     df_m = fetch_df(
@@ -722,7 +725,6 @@ def page_analytics():
 
     st.markdown("---")
 
-    # 3) Employee bars by work type (selected range)
     st.subheader("Employee output by work type (selected range)")
     by_emp = df.groupby(["work_type", "employee"], as_index=False)["actual_qty"].sum()
     by_emp = by_emp.sort_values(["work_type", "actual_qty"], ascending=[True, False])
