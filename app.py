@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text, bindparam
+from sqlalchemy import create_engine, text
 import plotly.express as px
 
 # =============================================================================
@@ -16,14 +16,11 @@ APP_TITLE = "Production Tracker"
 LOGO_CANDIDATES = [
     "silverscreen_logo.png",
     "silverscreen_logo.PNG",
-    "assets/silverscreen_logo.png",
-    "assets/silverscreen_logo.PNG",
 ]
 
-# Work types (rates are internal only; not shown in UI)
+# Work types + rates (per 8-hour shift)
 WORK_TYPES = ["Tags", "Stickers", "Picking", "VAS"]
 
-# Internal production rates (per 8-hour shift) - NOT displayed in UI
 TAG_RATES_PER_DAY = {
     "Del Sol": 800,
     "Cariloha": 500,
@@ -41,10 +38,7 @@ VAS_RATE_PER_DAY = 400
 
 INTERNAL_CUSTOMER_NAME = "Internal (Picking/VAS)"
 
-# Always hide Brandon Bell in UI (even if present in DB)
-HIDE_EMPLOYEE_FULLNAME_LOWER = "brandon bell"
-
-# Employees to seed (does NOT include Brandon Bell)
+# Employees to seed
 EMPLOYEE_SEED = [
     {"first_name": "Yesenia", "last_name": "Alcala villa"},
     {"first_name": "Andie", "last_name": "Dunsmore"},
@@ -60,7 +54,7 @@ EMPLOYEE_SEED = [
     {"first_name": "Steve", "last_name": "Zenz"},
 ]
 
-# FULL customer list + internal customer
+# FULL customer list you provided + internal customer
 CUSTOMER_SEED = [
     INTERNAL_CUSTOMER_NAME,
     "2469 - The UPS Store",
@@ -281,22 +275,17 @@ CUSTOMER_SEED = [
 ]
 
 # =============================================================================
-# DB (Neon / Postgres)
+# DB (Neon / Postgres) — uses Streamlit connections secret:
+# [connections.db]
+# url = "postgresql://..."
 # =============================================================================
 @st.cache_resource
 def get_engine():
-    # expects:
-    # [connections.db]
-    # url = "postgresql://..."
     return create_engine(st.secrets["connections"]["db"]["url"], pool_pre_ping=True)
 
-def fetch_df(sql, params: dict | None = None) -> pd.DataFrame:
-    """Accepts either a SQL string or a SQLAlchemy TextClause."""
+def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
     with get_engine().begin() as conn:
-        if isinstance(sql, str):
-            res = conn.execute(text(sql), params or {})
-        else:
-            res = conn.execute(sql, params or {})
+        res = conn.execute(text(sql), params or {})
         rows = res.mappings().all()
     return pd.DataFrame(rows)
 
@@ -368,35 +357,26 @@ def seed_employees():
     # seed only if employees is empty
     if not fetch_df("SELECT 1 FROM employees LIMIT 1;").empty:
         return
-
-    batch = [{"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]} for r in EMPLOYEE_SEED]
-    with get_engine().begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO employees (employee_id, first_name, last_name, is_active)
-                VALUES (:id, :fn, :ln, TRUE)
-                ON CONFLICT DO NOTHING
-            """),
-            batch,
+    for r in EMPLOYEE_SEED:
+        exec_sql(
+            """
+            INSERT INTO employees (employee_id, first_name, last_name, is_active)
+            VALUES (:id, :fn, :ln, TRUE)
+            ON CONFLICT DO NOTHING
+            """,
+            {"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]},
         )
 
 def seed_customers():
-    # ensure all customers exist (idempotent)
-    existing = fetch_df("SELECT customer_name FROM customers;")
-    existing_set = set(existing["customer_name"].tolist()) if not existing.empty else set()
-    missing = [name for name in CUSTOMER_SEED if name not in existing_set]
-    if not missing:
-        return
-
-    batch = [{"id": str(uuid.uuid4()), "name": n} for n in missing]
-    with get_engine().begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO customers (customer_id, customer_name, is_active)
-                VALUES (:id, :name, TRUE)
-                ON CONFLICT (customer_name) DO NOTHING
-            """),
-            batch,
+    # ALWAYS ensure all customers exist (idempotent)
+    for name in CUSTOMER_SEED:
+        exec_sql(
+            """
+            INSERT INTO customers (customer_id, customer_name, is_active)
+            VALUES (:id, :name, TRUE)
+            ON CONFLICT (customer_name) DO NOTHING
+            """,
+            {"id": str(uuid.uuid4()), "name": name},
         )
 
 def boot():
@@ -420,6 +400,8 @@ def sidebar():
             st.image(logo, use_container_width=True)
         st.markdown("---")
         page = st.radio("Navigate", ["Submissions", "Analytics", "Employees", "Customers"], label_visibility="collapsed")
+        st.markdown("---")
+        st.caption("Rates (per 8 hrs): Tags varies • Stickers 2400 • Picking 3000 • VAS 400")
     return page
 
 def expected_qty(customer: str, work_type: str, hours: float) -> int:
@@ -449,34 +431,21 @@ def month_start(d: date) -> date:
 def week_start_monday(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
-def actual_label_for(work_type: str) -> str:
-    return {
-        "Tags": "Pieces tagged",
-        "Stickers": "Stickers adhered",
-        "Picking": "Pieces picked",
-        "VAS": "Pieces processed (VAS)",
-    }.get(work_type, "Pieces completed")
+# =============================================================================
+# PAGES
+# =============================================================================
+def page_submissions():
+    st.title("Submissions")
+    st.write("Log a shift (or partial shift). Add multiple lines for split shifts.")
 
-# =============================================================================
-# CACHED LOOKUPS
-# =============================================================================
-@st.cache_data(ttl=30)
-def get_active_employees_df():
-    return fetch_df(
-        """
+    emp_df = fetch_df("""
         SELECT employee_id::text AS employee_id, first_name, last_name
         FROM employees
         WHERE is_active = TRUE
-          AND lower(first_name || ' ' || last_name) <> :hide_name
         ORDER BY first_name, last_name
-        """,
-        {"hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
-    )
+    """)
 
-@st.cache_data(ttl=60)
-def get_active_customers_df():
-    return fetch_df(
-        """
+    cust_df = fetch_df("""
         SELECT customer_name
         FROM customers
         WHERE is_active = TRUE
@@ -489,19 +458,7 @@ def get_active_customers_df():
             ELSE 99
           END,
           customer_name
-        """,
-        {"internal": INTERNAL_CUSTOMER_NAME},
-    )
-
-# =============================================================================
-# PAGES
-# =============================================================================
-def page_submissions():
-    st.title("Submissions")
-    st.write('Log a shift (or partial shift). Use "Add another submission" for split shifts.')
-
-    emp_df = get_active_employees_df()
-    cust_df = get_active_customers_df()
+    """, {"internal": INTERNAL_CUSTOMER_NAME})
 
     if emp_df.empty:
         st.error("No active employees. Add employees in the Employees page.")
@@ -521,20 +478,18 @@ def page_submissions():
             "work_type": "Tags",
             "customer": customer_list[0],
             "hours": 8.0,
-            "actual": 0,
-            "notes": "",
+            "actual": None,
         }]
 
     def add_row():
         last = st.session_state.draft_rows[-1]
         st.session_state.draft_rows.append({
             "entry_date": last["entry_date"],
-            "employee_label": last["employee_label"],  # same employee
+            "employee_label": last["employee_label"],
             "work_type": last["work_type"],
             "customer": last["customer"],
             "hours": 4.0,
-            "actual": 0,
-            "notes": "",
+            "actual": None,
         })
 
     def remove_row(i: int):
@@ -543,130 +498,41 @@ def page_submissions():
         st.session_state.draft_rows.pop(i)
 
     for i, row in enumerate(st.session_state.draft_rows):
-        # Row 0 captures the "who/when" for the day.
-        # Additional rows are meant for split shifts / additional work and should NOT ask for employee again.
-        if i == 0:
-            c1, c2, c3, c4, c5 = st.columns([1.35, 1.7, 1.3, 2.0, 1.0])
+        st.markdown(f"### Entry {i+1}")
+        c1, c2, c3, c4, c5 = st.columns([1.1, 1.7, 1.3, 2.0, 1.2])
 
-            # Calendar + forced format
-            row["entry_date"] = c1.date_input(
-                "Date",
-                value=row["entry_date"],
-                format="MM/DD/YYYY",
-                key=f"d_{i}",
-            )
+        row["entry_date"] = c1.date_input("Date", value=row["entry_date"], key=f"d_{i}")
+        row["employee_label"] = c2.selectbox("Employee", emp_labels, index=emp_labels.index(row["employee_label"]), key=f"e_{i}")
+        row["work_type"] = c3.selectbox("Work Type", WORK_TYPES, index=WORK_TYPES.index(row["work_type"]), key=f"wt_{i}")
 
-            row["employee_label"] = c2.selectbox(
-                "Employee",
-                emp_labels,
-                index=emp_labels.index(row["employee_label"]),
-                key=f"e_{i}",
-            )
-
-            row["work_type"] = c3.selectbox(
-                "Work type",
-                WORK_TYPES,
-                index=WORK_TYPES.index(row["work_type"]),
-                key=f"wt_{i}",
-            )
-
-            # Customer
-            if row["work_type"] in ("Picking", "VAS"):
-                row["customer"] = INTERNAL_CUSTOMER_NAME
-                c4.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
-            else:
-                if row["customer"] not in customer_list:
-                    row["customer"] = customer_list[0]
-                row["customer"] = c4.selectbox(
-                    "Customer",
-                    customer_list,
-                    index=customer_list.index(row["customer"]),
-                    key=f"c_{i}",
-                )
-
-            row["hours"] = c5.number_input(
-                "Hours",
-                min_value=0.25,
-                max_value=12.0,
-                value=float(row["hours"]),
-                step=0.25,
-                key=f"h_{i}",
-            )
-
+        if row["work_type"] in ("Picking", "VAS"):
+            row["customer"] = INTERNAL_CUSTOMER_NAME
+            c4.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
         else:
-            # Lock to the first row's date + employee
-            row["entry_date"] = st.session_state.draft_rows[0]["entry_date"]
-            row["employee_label"] = st.session_state.draft_rows[0]["employee_label"]
+            if row["customer"] not in customer_list:
+                row["customer"] = customer_list[0]
+            row["customer"] = c4.selectbox("Customer", customer_list, index=customer_list.index(row["customer"]), key=f"c_{i}")
 
-            # For added rows: start with Work type -> Customer -> Hours -> Pieces
-            c1, c2, c3, c4, c5 = st.columns([1.3, 2.2, 1.0, 1.7, 0.8])
+        row["hours"] = c5.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours"]), step=0.25, key=f"h_{i}")
 
-            row["work_type"] = c1.selectbox(
-                "Work type",
-                WORK_TYPES,
-                index=WORK_TYPES.index(row["work_type"]),
-                key=f"wt_{i}",
-            )
+        exp = expected_qty(row["customer"], row["work_type"], float(row["hours"]))
+        default_actual = exp if row["actual"] is None else int(row["actual"])
 
-            if row["work_type"] in ("Picking", "VAS"):
-                row["customer"] = INTERNAL_CUSTOMER_NAME
-                c2.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
-            else:
-                if row["customer"] not in customer_list:
-                    row["customer"] = customer_list[0]
-                row["customer"] = c2.selectbox(
-                    "Customer",
-                    customer_list,
-                    index=customer_list.index(row["customer"]),
-                    key=f"c_{i}",
-                )
-
-            row["hours"] = c3.number_input(
-                "Hours",
-                min_value=0.25,
-                max_value=12.0,
-                value=float(row["hours"]),
-                step=0.25,
-                key=f"h_{i}",
-            )
-
-        # Pieces (label depends on work type)
-        label = actual_label_for(row["work_type"])
-
-        if i == 0:
-            row["actual"] = st.number_input(
-                label,
-                min_value=0,
-                value=int(row.get("actual", 0)),
-                step=10,
-                key=f"a_{i}",
-            )
-            row["notes"] = st.text_input(
-                "Notes (optional)",
-                value=row.get("notes", ""),
-                key=f"n_{i}",
-            )
-        else:
-            row["actual"] = c4.number_input(
-                label,
-                min_value=0,
-                value=int(row.get("actual", 0)),
-                step=10,
-                key=f"a_{i}",
-            )
-            # Optional notes below the row (keeps the row compact)
-            row["notes"] = st.text_input(
-                "Notes (optional)",
-                value=row.get("notes", ""),
-                key=f"n_{i}",
-            )
-
-            if c5.button("🗑️ Remove", key=f"rm_{i}", use_container_width=True):
-                remove_row(i)
-                st.rerun()
+        row["actual"] = st.number_input("Actual pieces completed", min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
+
+        eff = (row["actual"] / exp * 100.0) if exp > 0 else 0.0
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Expected (prorated)", f"{exp:,}")
+        k2.metric("Actual", f"{int(row['actual']):,}")
+        k3.metric("Efficiency", f"{eff:.0f}%")
+
+        if len(st.session_state.draft_rows) > 1:
+            if st.button("🗑️ Remove this entry", key=f"rm_{i}"):
+                remove_row(i)
+                st.rerun()
 
         st.markdown("---")
 
@@ -675,40 +541,38 @@ def page_submissions():
         add_row()
         st.rerun()
 
-    if b2.button("✅ Save ALL submissions", use_container_width=True):
+    if b2.button("✅ Save ALL entries", use_container_width=True):
         errors = []
         for idx, r in enumerate(st.session_state.draft_rows, start=1):
             if float(r["hours"]) <= 0:
-                errors.append(f"Submission {idx}: Hours must be > 0.")
+                errors.append(f"Entry {idx}: Hours must be > 0.")
             if r["work_type"] == "Stickers" and r["customer"] not in STICKER_ALLOWED_CUSTOMERS:
-                errors.append(f"Submission {idx}: Stickers only allowed for Del Sol and Cariloha.")
+                errors.append(f"Entry {idx}: Stickers only allowed for Del Sol and Cariloha.")
         if errors:
             st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
-        insert_sql = text("""
-            INSERT INTO production_entries
-              (entry_id, entry_date, employee_id, customer_name, work_type,
-               hours_worked, actual_qty, expected_qty, notes)
-            VALUES
-              (:id, :d, :eid, :c, :wt, :h, :a, :e, :n)
-        """)
-
-        with get_engine().begin() as conn:
-            for r in st.session_state.draft_rows:
-                exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
-                params = {
-                    "id": uuid.uuid4(),
+        for r in st.session_state.draft_rows:
+            exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
+            exec_sql(
+                """
+                INSERT INTO production_entries
+                  (entry_id, entry_date, employee_id, customer_name, work_type,
+                   hours_worked, actual_qty, expected_qty, notes)
+                VALUES
+                  (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, :n)
+                """,
+                {
+                    "id": str(uuid.uuid4()),
                     "d": r["entry_date"],
-                    "eid": uuid.UUID(emp_label_to_id[r["employee_label"]]),
+                    "eid": emp_label_to_id[r["employee_label"]],
                     "c": r["customer"],
                     "wt": r["work_type"],
                     "h": float(r["hours"]),
                     "a": int(r["actual"]),
                     "e": int(exp),
-                    "n": r["notes"].strip() if r.get("notes") else None,
-                }
-                conn.execute(insert_sql, params)
+                },
+            )
 
         st.success("Saved ✅")
         st.session_state.draft_rows = [{
@@ -717,11 +581,9 @@ def page_submissions():
             "work_type": "Tags",
             "customer": customer_list[0],
             "hours": 8.0,
-            "actual": 0,
-            "notes": "",
+            "actual": None,
         }]
         st.rerun()
-
 def page_analytics():
     st.title("Analytics")
 
@@ -740,13 +602,15 @@ def page_analytics():
         st.info("Select at least one work type.")
         return
 
-    # IMPORTANT: use expanding bindparam for IN (...) list
+    # Use expanding bindparam for IN (...) list
     sql = text("""
         SELECT
+          pe.entry_id::text AS entry_id,
           pe.entry_date,
           e.first_name || ' ' || e.last_name AS employee,
           pe.work_type,
           pe.customer_name,
+          pe.hours_worked,
           pe.actual_qty,
           pe.expected_qty
         FROM production_entries pe
@@ -777,6 +641,23 @@ def page_analytics():
 
     st.markdown("---")
 
+    # 1) Employee output by work type (selected range)
+    st.subheader("Employee output by work type (selected range)")
+    by_emp = df.groupby(["work_type", "employee"], as_index=False)["actual_qty"].sum()
+    by_emp = by_emp.sort_values(["work_type", "actual_qty"], ascending=[True, False])
+
+    for wt in WORK_TYPES:
+        sub = by_emp[by_emp["work_type"] == wt]
+        if sub.empty:
+            st.caption(f"No {wt} in this range.")
+            continue
+        fig = px.bar(sub, x="employee", y="actual_qty")
+        fig.update_layout(title=f"{wt} — pieces by employee", xaxis_title="", yaxis_title="Pieces")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # 2) Team total production — previous 5 business days (one point per day)
     st.subheader("Team total production — previous 5 business days")
     biz_days = previous_business_days(5, today)
     s5, e5 = biz_days[0], biz_days[-1]
@@ -792,87 +673,83 @@ def page_analytics():
         {"s": s5, "e": e5},
     )
 
-    # Build a stable frame that always has the expected columns,
-    # even when there are no DB rows for the previous 5 business days.
     frame = pd.DataFrame({"entry_date": biz_days})
-    frame["total_actual"] = 0  # prevents KeyError if df_5 is empty
+    frame["total_actual"] = 0
 
     if not df_5.empty:
         df_5["entry_date"] = pd.to_datetime(df_5["entry_date"]).dt.date
-
-        # Ensure the aggregate column exists (and is numeric-ish) before merging
-        if "total_actual" not in df_5.columns:
-            df_5["total_actual"] = 0
-
-        frame = frame.merge(df_5[["entry_date", "total_actual"]], on="entry_date", how="left")
-
-        # If a merge ever introduces suffixes, recover gracefully
-        if "total_actual" not in frame.columns:
-            if "total_actual_x" in frame.columns:
-                frame["total_actual"] = frame["total_actual_x"]
-            elif "total_actual_y" in frame.columns:
-                frame["total_actual"] = frame["total_actual_y"]
-            else:
-                frame["total_actual"] = 0
+        frame = frame.merge(df_5, on="entry_date", how="left")
 
     frame["total_actual"] = pd.to_numeric(frame["total_actual"], errors="coerce").fillna(0).astype(int)
+    frame["day"] = pd.to_datetime(frame["entry_date"]).dt.strftime("%Y-%m-%d")
 
-    fig1 = px.line(frame, x="entry_date", y="total_actual", markers=True)
+    fig1 = px.line(frame, x="day", y="total_actual", markers=True)
     fig1.update_layout(xaxis_title="Day", yaxis_title="Pieces")
     st.plotly_chart(fig1, use_container_width=True)
 
-    st.subheader("Monthly total production — weekly points (month-to-date)")
-    m_start = month_start(today)
-    df_m = fetch_df(
+    # 3) Monthly totals — last day of each month (one point per month)
+    st.subheader("Monthly total production — month-end points (selected range)")
+    df_month = fetch_df(
         """
-        SELECT entry_date, SUM(actual_qty) AS total_actual
+        SELECT
+          (date_trunc('month', entry_date)::date + INTERVAL '1 month - 1 day')::date AS month_end,
+          SUM(actual_qty) AS total_actual
         FROM production_entries
-        WHERE entry_date BETWEEN :mstart AND :mend
-        GROUP BY entry_date
-        ORDER BY entry_date
+        WHERE entry_date BETWEEN :s AND :e
+        GROUP BY month_end
+        ORDER BY month_end
         """,
-        {"mstart": m_start, "mend": today},
+        {"s": start, "e": end},
     )
 
-    if df_m.empty:
-        st.info("No month-to-date entries yet.")
+    if df_month.empty:
+        st.info("No monthly totals for the selected range.")
     else:
-        df_m["entry_date"] = pd.to_datetime(df_m["entry_date"]).dt.date
-        df_m["week_start"] = df_m["entry_date"].apply(week_start_monday)
-        weekly = df_m.groupby("week_start", as_index=False)["total_actual"].sum().sort_values("week_start")
+        df_month["month_end"] = pd.to_datetime(df_month["month_end"]).dt.strftime("%Y-%m-%d")
+        df_month["total_actual"] = pd.to_numeric(df_month["total_actual"], errors="coerce").fillna(0).astype(int)
 
-        fig2 = px.line(weekly, x="week_start", y="total_actual", markers=True)
-        fig2.update_layout(xaxis_title="Week (Mon start)", yaxis_title="Pieces")
+        fig2 = px.line(df_month, x="month_end", y="total_actual", markers=True)
+        fig2.update_layout(xaxis_title="Month end", yaxis_title="Pieces")
         st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("---")
 
-    st.subheader("Employee output by work type (selected range)")
-    by_emp = df.groupby(["work_type", "employee"], as_index=False)["actual_qty"].sum()
-    by_emp = by_emp.sort_values(["work_type", "actual_qty"], ascending=[True, False])
+    # 4) Delete records
+    st.subheader("Delete a submission (fix typos)")
+    st.caption("Use the table to find the record, then delete it below. This is permanent.")
 
-    for wt in WORK_TYPES:
-        sub = by_emp[by_emp["work_type"] == wt]
-        if sub.empty:
-            st.caption(f"No {wt} in this range.")
-            continue
-        fig = px.bar(sub, x="employee", y="actual_qty")
-        fig.update_layout(title=f"{wt} — pieces by employee", xaxis_title="", yaxis_title="Pieces")
-        st.plotly_chart(fig, use_container_width=True)
+    view_df = df.copy()
+    view_df["entry_date"] = pd.to_datetime(view_df["entry_date"]).dt.strftime("%Y-%m-%d")
+    view_df = view_df.sort_values(["entry_date", "employee", "work_type", "customer_name"], ascending=[False, True, True, True])
+
+    st.dataframe(
+        view_df[["entry_date","employee","work_type","customer_name","hours_worked","actual_qty","entry_id"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    labels = [
+        f'{r.entry_date} | {r.employee} | {r.work_type} | {r.customer_name} | hrs {float(r.hours_worked):g} | qty {int(r.actual_qty)}'
+        for r in view_df.itertuples(index=False)
+    ]
+    pick = st.selectbox("Select a row to delete", labels, key="del_pick")
+    selected_id = view_df.iloc[labels.index(pick)]["entry_id"]
+
+    confirm = st.checkbox("I understand this permanently deletes the selected record.", key="del_confirm")
+    if st.button("🗑️ Delete selected record", type="primary", disabled=not confirm):
+        exec_sql("DELETE FROM production_entries WHERE entry_id = :id::uuid", {"id": selected_id})
+        st.success("Deleted ✅")
+        st.rerun()
+
 
 def page_employees():
     st.title("Employees")
 
-    emp = fetch_df(
-        """
+    emp = fetch_df("""
         SELECT employee_id::text AS employee_id, first_name, last_name, is_active
         FROM employees
-        WHERE lower(first_name || ' ' || last_name) <> :hide_name
         ORDER BY is_active DESC, first_name, last_name
-        """,
-        {"hide_name": HIDE_EMPLOYEE_FULLNAME_LOWER},
-    )
-
+    """)
     st.dataframe(emp[["first_name", "last_name", "is_active"]], use_container_width=True, hide_index=True)
 
     st.markdown("---")
@@ -883,11 +760,8 @@ def page_employees():
         fn = st.text_input("First name", key="emp_fn")
         ln = st.text_input("Last name", key="emp_ln")
         if st.button("➕ Add employee"):
-            fn2, ln2 = fn.strip(), ln.strip()
-            if not fn2 or not ln2:
+            if not fn.strip() or not ln.strip():
                 st.error("Enter both first and last name.")
-            elif f"{fn2} {ln2}".strip().lower() == HIDE_EMPLOYEE_FULLNAME_LOWER:
-                st.error("That employee is hidden from this app.")
             else:
                 exec_sql(
                     """
@@ -895,40 +769,30 @@ def page_employees():
                     VALUES (:id, :fn, :ln, TRUE)
                     ON CONFLICT DO NOTHING
                     """,
-                    {"id": str(uuid.uuid4()), "fn": fn2, "ln": ln2},
+                    {"id": str(uuid.uuid4()), "fn": fn.strip(), "ln": ln.strip()},
                 )
-                get_active_employees_df.clear()
                 st.success("Added ✅")
                 st.rerun()
 
     with colB:
         st.subheader("Deactivate / Reactivate")
-        if emp.empty:
-            st.info("No employees available.")
-            return
-
         labels = [
             f"{r.first_name} {r.last_name} ({'Active' if r.is_active else 'Inactive'})"
             for r in emp.itertuples(index=False)
         ]
         pick = st.selectbox("Select employee", labels, key="emp_pick")
-
         selected = emp.iloc[labels.index(pick)]
-        emp_id = selected["employee_id"]
-        is_active = bool(selected["is_active"])
-        btn = "Deactivate" if is_active else "Reactivate"
-
-        if st.button(btn, use_container_width=True):
+        new_state = not bool(selected["is_active"])
+        btn = "Deactivate" if selected["is_active"] else "Reactivate"
+        if st.button(f"🔁 {btn}", key="emp_toggle"):
             exec_sql(
                 """
                 UPDATE employees
-                SET is_active = :new_state,
-                    updated_at = now()
+                SET is_active = :s, updated_at = NOW()
                 WHERE employee_id = :id::uuid
                 """,
-                {"new_state": (not is_active), "id": emp_id},
+                {"s": new_state, "id": selected["employee_id"]},
             )
-            get_active_employees_df.clear()
             st.success("Updated ✅")
             st.rerun()
 
@@ -936,8 +800,7 @@ def page_customers():
     st.title("Customers")
     st.write("All customers are seeded automatically. You can add more, or deactivate/reactivate existing ones.")
 
-    cust = fetch_df(
-        """
+    cust = fetch_df("""
         SELECT customer_id::text AS customer_id, customer_name, is_active
         FROM customers
         ORDER BY is_active DESC,
@@ -949,9 +812,7 @@ def page_customers():
             ELSE 99
           END,
           customer_name
-        """,
-        {"internal": INTERNAL_CUSTOMER_NAME},
-    )
+    """, {"internal": INTERNAL_CUSTOMER_NAME})
 
     st.dataframe(cust[["customer_name", "is_active"]], use_container_width=True, hide_index=True)
 
@@ -974,22 +835,17 @@ def page_customers():
                     """,
                     {"id": str(uuid.uuid4()), "name": nm},
                 )
-                get_active_customers_df.clear()
                 st.success("Saved ✅")
                 st.rerun()
 
     with colB:
         st.subheader("Deactivate / Reactivate")
-        if cust.empty:
-            st.info("No customers available.")
-            return
-
         labels = [f"{r.customer_name} ({'Active' if r.is_active else 'Inactive'})" for r in cust.itertuples(index=False)]
         pick = st.selectbox("Select customer", labels, key="cust_pick")
         selected = cust.iloc[labels.index(pick)]
         new_state = not bool(selected["is_active"])
         btn = "Deactivate" if selected["is_active"] else "Reactivate"
-        if st.button(btn, use_container_width=True):
+        if st.button(f"🔁 {btn}", key="cust_toggle"):
             exec_sql(
                 """
                 UPDATE customers
@@ -998,7 +854,6 @@ def page_customers():
                 """,
                 {"s": new_state, "id": selected["customer_id"]},
             )
-            get_active_customers_df.clear()
             st.success("Updated ✅")
             st.rerun()
 
