@@ -1,6 +1,6 @@
 import uuid
 from pathlib import Path
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -281,9 +281,7 @@ CUSTOMER_SEED = [
 ]
 
 # =============================================================================
-# DB (Neon / Postgres) — uses Streamlit connections secret:
-# [connections.db]
-# url = "postgresql://..."
+# DB (Neon / Postgres)
 # =============================================================================
 @st.cache_resource
 def get_engine():
@@ -343,6 +341,7 @@ def init_db():
       ON production_entries(employee_id);
     """)
 
+    # enforce work_type constraint (idempotent)
     exec_sql("""
     DO $$
     BEGIN
@@ -361,7 +360,6 @@ def init_db():
 def seed_employees():
     if not fetch_df("SELECT 1 FROM employees LIMIT 1;").empty:
         return
-
     batch = [{"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]} for r in EMPLOYEE_SEED]
     with get_engine().begin() as conn:
         conn.execute(
@@ -376,11 +374,9 @@ def seed_employees():
 def seed_customers():
     existing = fetch_df("SELECT customer_name FROM customers;")
     existing_set = set(existing["customer_name"].tolist()) if not existing.empty else set()
-
     missing = [name for name in CUSTOMER_SEED if name not in existing_set]
     if not missing:
         return
-
     batch = [{"id": str(uuid.uuid4()), "name": n} for n in missing]
     with get_engine().begin() as conn:
         conn.execute(
@@ -416,7 +412,6 @@ def sidebar():
     return page
 
 def expected_qty(customer: str, work_type: str, hours: float) -> int:
-    # internal only
     if work_type == "Tags":
         rate = TAG_RATES_PER_DAY.get(customer, DEFAULT_TAG_RATE_PER_DAY)
     elif work_type == "Stickers":
@@ -450,18 +445,6 @@ def actual_label_for(work_type: str) -> str:
         "Picking": "Pieces picked",
         "VAS": "Pieces processed (VAS)",
     }.get(work_type, "Pieces completed")
-
-def mmddyyyy_input(label: str, value: date, key: str) -> date:
-    """
-    Text input that enforces MM/DD/YYYY display/entry.
-    Returns the prior value if parsing fails (and shows an error).
-    """
-    s = st.text_input(label, value.strftime("%m/%d/%Y"), key=key).strip()
-    try:
-        return datetime.strptime(s, "%m/%d/%Y").date()
-    except ValueError:
-        st.error(f"{label}: use MM/DD/YYYY (example: 02/01/2026)")
-        return value
 
 # =============================================================================
 # CACHED LOOKUPS
@@ -531,11 +514,10 @@ def page_submissions():
         }]
 
     def add_row():
-        # Always assume same employee + same date for split shifts
         last = st.session_state.draft_rows[-1]
         st.session_state.draft_rows.append({
             "entry_date": last["entry_date"],
-            "employee_label": last["employee_label"],
+            "employee_label": last["employee_label"],  # same employee
             "work_type": last["work_type"],
             "customer": last["customer"],
             "hours": 4.0,
@@ -550,8 +532,13 @@ def page_submissions():
     for i, row in enumerate(st.session_state.draft_rows):
         c1, c2, c3, c4, c5 = st.columns([1.35, 1.7, 1.3, 2.0, 1.0])
 
-        with c1:
-            row["entry_date"] = mmddyyyy_input("Date", row["entry_date"], key=f"d_{i}")
+        # Calendar + forced format
+        row["entry_date"] = c1.date_input(
+            "Date",
+            value=row["entry_date"],
+            format="MM/DD/YYYY",
+            key=f"d_{i}",
+        )
 
         row["employee_label"] = c2.selectbox(
             "Employee",
@@ -624,31 +611,29 @@ def page_submissions():
             st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
+        # Safer insert: row-by-row in one transaction, and pass real UUID objects
+        insert_sql = text("""
+            INSERT INTO production_entries
+              (entry_id, entry_date, employee_id, customer_name, work_type,
+               hours_worked, actual_qty, expected_qty, notes)
+            VALUES
+              (:id, :d, :eid, :c, :wt, :h, :a, :e, NULL)
+        """)
+
         with get_engine().begin() as conn:
-            batch = []
             for r in st.session_state.draft_rows:
                 exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
-                batch.append({
-                    "id": str(uuid.uuid4()),
+                params = {
+                    "id": uuid.uuid4(),
                     "d": r["entry_date"],
-                    "eid": emp_label_to_id[r["employee_label"]],
+                    "eid": uuid.UUID(emp_label_to_id[r["employee_label"]]),
                     "c": r["customer"],
                     "wt": r["work_type"],
                     "h": float(r["hours"]),
                     "a": int(r["actual"]),
                     "e": int(exp),
-                })
-
-            conn.execute(
-                text("""
-                    INSERT INTO production_entries
-                      (entry_id, entry_date, employee_id, customer_name, work_type,
-                       hours_worked, actual_qty, expected_qty, notes)
-                    VALUES
-                      (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, NULL)
-                """),
-                batch
-            )
+                }
+                conn.execute(insert_sql, params)
 
         st.success("Saved ✅")
         st.session_state.draft_rows = [{
@@ -668,12 +653,9 @@ def page_analytics():
     default_start = month_start(today)
 
     c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
-    with c1:
-        start = mmddyyyy_input("Start", default_start, key="ana_start")
-    with c2:
-        end = mmddyyyy_input("End", today, key="ana_end")
-    with c3:
-        type_filter = st.multiselect("Work Types", WORK_TYPES, default=WORK_TYPES)
+    start = c1.date_input("Start", value=default_start, format="MM/DD/YYYY")
+    end = c2.date_input("End", value=today, format="MM/DD/YYYY")
+    type_filter = c3.multiselect("Work Types", WORK_TYPES, default=WORK_TYPES)
 
     if start > end:
         st.error("Start must be <= End.")
@@ -833,106 +815,4 @@ def page_employees():
         pick = st.selectbox("Select employee", labels, key="emp_pick")
         selected = emp.iloc[labels.index(pick)]
         new_state = not bool(selected["is_active"])
-        btn = "Deactivate" if selected["is_active"] else "Reactivate"
-        if st.button(f"🔁 {btn}", key="emp_toggle"):
-            exec_sql(
-                """
-                UPDATE employees
-                SET is_active = :s, updated_at = NOW()
-                WHERE employee_id = :id::uuid
-                """,
-                {"s": new_state, "id": selected["employee_id"]},
-            )
-            get_active_employees_df.clear()
-            st.success("Updated ✅")
-            st.rerun()
-
-def page_customers():
-    st.title("Customers")
-
-    cust = fetch_df(
-        """
-        SELECT customer_id::text AS customer_id, customer_name, is_active
-        FROM customers
-        ORDER BY is_active DESC,
-          CASE
-            WHEN customer_name = 'Del Sol' THEN 1
-            WHEN customer_name = 'Cariloha' THEN 2
-            WHEN customer_name LIKE 'Purpose%' THEN 3
-            WHEN customer_name = :internal THEN 98
-            ELSE 99
-          END,
-          customer_name
-        """,
-        {"internal": INTERNAL_CUSTOMER_NAME},
-    )
-
-    st.dataframe(cust[["customer_name", "is_active"]], use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    colA, colB = st.columns(2)
-
-    with colA:
-        st.subheader("Add customer")
-        name = st.text_input("Customer name", key="cust_name")
-        if st.button("➕ Add customer"):
-            nm = name.strip()
-            if not nm:
-                st.error("Enter a customer name.")
-            else:
-                exec_sql(
-                    """
-                    INSERT INTO customers (customer_id, customer_name, is_active)
-                    VALUES (:id, :name, TRUE)
-                    ON CONFLICT (customer_name) DO NOTHING
-                    """,
-                    {"id": str(uuid.uuid4()), "name": nm},
-                )
-                get_active_customers_df.clear()
-                st.success("Saved ✅")
-                st.rerun()
-
-    with colB:
-        st.subheader("Deactivate / Reactivate")
-        if cust.empty:
-            st.info("No customers available.")
-            return
-
-        labels = [f"{r.customer_name} ({'Active' if r.is_active else 'Inactive'})" for r in cust.itertuples(index=False)]
-        pick = st.selectbox("Select customer", labels, key="cust_pick")
-        selected = cust.iloc[labels.index(pick)]
-        new_state = not bool(selected["is_active"])
-        btn = "Deactivate" if selected["is_active"] else "Reactivate"
-        if st.button(f"🔁 {btn}", key="cust_toggle"):
-            exec_sql(
-                """
-                UPDATE customers
-                SET is_active = :s, updated_at = NOW()
-                WHERE customer_id = :id::uuid
-                """,
-                {"s": new_state, "id": selected["customer_id"]},
-            )
-            get_active_customers_df.clear()
-            st.success("Updated ✅")
-            st.rerun()
-
-# =============================================================================
-# MAIN
-# =============================================================================
-st.title(APP_TITLE)
-
-try:
-    boot()
-except Exception as e:
-    st.error(f"Database init failed: {e}")
-    st.stop()
-
-page = sidebar()
-if page == "Submissions":
-    page_submissions()
-elif page == "Analytics":
-    page_analytics()
-elif page == "Employees":
-    page_employees()
-else:
-    page_customers()
+        btn = "Deactivate" if selected["is_active"] else "React_]()
