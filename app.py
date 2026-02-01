@@ -38,6 +38,10 @@ VAS_RATE_PER_DAY = 400
 
 INTERNAL_CUSTOMER_NAME = "Internal (Picking/VAS)"
 
+# If you ever want to hide one employee from analytics (like "test user"), set it here (lowercase).
+# Leave as "" to hide nobody.
+HIDE_EMPLOYEE_FULLNAME_LOWER = ""  # e.g. "brandon bell"
+
 # Employees to seed
 EMPLOYEE_SEED = [
     {"first_name": "Yesenia", "last_name": "Alcala villa"},
@@ -275,7 +279,8 @@ CUSTOMER_SEED = [
 ]
 
 # =============================================================================
-# DB (Neon / Postgres) — uses Streamlit connections secret:
+# DB (Neon / Postgres)
+# Streamlit secrets should contain:
 # [connections.db]
 # url = "postgresql://..."
 # =============================================================================
@@ -283,9 +288,9 @@ CUSTOMER_SEED = [
 def get_engine():
     return create_engine(st.secrets["connections"]["db"]["url"], pool_pre_ping=True)
 
-def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+def fetch_df(sql_obj, params: dict | None = None) -> pd.DataFrame:
     with get_engine().begin() as conn:
-        res = conn.execute(text(sql), params or {})
+        res = conn.execute(sql_obj if hasattr(sql_obj, "compile") else text(sql_obj), params or {})
         rows = res.mappings().all()
     return pd.DataFrame(rows)
 
@@ -354,7 +359,6 @@ def init_db():
     """)
 
 def seed_employees():
-    # seed only if employees is empty
     if not fetch_df("SELECT 1 FROM employees LIMIT 1;").empty:
         return
     for r in EMPLOYEE_SEED:
@@ -368,7 +372,6 @@ def seed_employees():
         )
 
 def seed_customers():
-    # ALWAYS ensure all customers exist (idempotent)
     for name in CUSTOMER_SEED:
         exec_sql(
             """
@@ -428,8 +431,33 @@ def previous_business_days(n: int, end_day: date | None = None) -> list[date]:
 def month_start(d: date) -> date:
     return d.replace(day=1)
 
-def week_start_monday(d: date) -> date:
-    return d - timedelta(days=d.weekday())
+def get_active_customers_df() -> pd.DataFrame:
+    return fetch_df(
+        """
+        SELECT customer_name
+        FROM customers
+        WHERE is_active = TRUE
+        ORDER BY
+          CASE
+            WHEN customer_name = 'Del Sol' THEN 1
+            WHEN customer_name = 'Cariloha' THEN 2
+            WHEN customer_name LIKE 'Purpose%' THEN 3
+            WHEN customer_name = :internal THEN 98
+            ELSE 99
+          END,
+          customer_name
+        """,
+        {"internal": INTERNAL_CUSTOMER_NAME},
+    )
+
+def actual_label_for(work_type: str) -> str:
+    if work_type == "Picking":
+        return "Actual picks completed"
+    if work_type == "VAS":
+        return "Actual VAS completed"
+    if work_type == "Stickers":
+        return "Actual stickers completed"
+    return "Actual tags completed"
 
 # =============================================================================
 # PAGES
@@ -445,20 +473,7 @@ def page_submissions():
         ORDER BY first_name, last_name
     """)
 
-    cust_df = fetch_df("""
-        SELECT customer_name
-        FROM customers
-        WHERE is_active = TRUE
-        ORDER BY
-          CASE
-            WHEN customer_name = 'Del Sol' THEN 1
-            WHEN customer_name = 'Cariloha' THEN 2
-            WHEN customer_name LIKE 'Purpose%' THEN 3
-            WHEN customer_name = :internal THEN 98
-            ELSE 99
-          END,
-          customer_name
-    """, {"internal": INTERNAL_CUSTOMER_NAME})
+    cust_df = get_active_customers_df()
 
     if emp_df.empty:
         st.error("No active employees. Add employees in the Employees page.")
@@ -479,6 +494,7 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": None,
+            "notes": "",
         }]
 
     def add_row():
@@ -490,6 +506,7 @@ def page_submissions():
             "customer": last["customer"],
             "hours": 4.0,
             "actual": None,
+            "notes": "",
         })
 
     def remove_row(i: int):
@@ -517,8 +534,10 @@ def page_submissions():
 
         exp = expected_qty(row["customer"], row["work_type"], float(row["hours"]))
         default_actual = exp if row["actual"] is None else int(row["actual"])
+        label_actual = actual_label_for(row["work_type"])
+        row["actual"] = st.number_input(label_actual, min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
 
-        row["actual"] = st.number_input("Actual pieces completed", min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
+        row["notes"] = st.text_input("Notes (optional)", value=row.get("notes", ""), key=f"n_{i}")
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
@@ -571,6 +590,7 @@ def page_submissions():
                     "h": float(r["hours"]),
                     "a": int(r["actual"]),
                     "e": int(exp),
+                    "n": (r.get("notes") or "").strip() or None,
                 },
             )
 
@@ -582,8 +602,10 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": None,
+            "notes": "",
         }]
         st.rerun()
+
 def page_analytics():
     st.title("Analytics")
 
@@ -602,7 +624,6 @@ def page_analytics():
         st.info("Select at least one work type.")
         return
 
-    # Use expanding bindparam for IN (...) list
     sql = text("""
         SELECT
           pe.entry_id::text AS entry_id,
@@ -617,7 +638,7 @@ def page_analytics():
         JOIN employees e ON e.employee_id = pe.employee_id
         WHERE pe.entry_date BETWEEN :s AND :e
           AND pe.work_type IN :types
-          AND lower(e.first_name || ' ' || e.last_name) <> :hide_name
+          AND (:hide_name = '' OR lower(e.first_name || ' ' || e.last_name) <> :hide_name)
     """).bindparams(bindparam("types", expanding=True))
 
     df = fetch_df(
@@ -641,7 +662,6 @@ def page_analytics():
 
     st.markdown("---")
 
-    # 1) Employee output by work type (selected range)
     st.subheader("Employee output by work type (selected range)")
     by_emp = df.groupby(["work_type", "employee"], as_index=False)["actual_qty"].sum()
     by_emp = by_emp.sort_values(["work_type", "actual_qty"], ascending=[True, False])
@@ -657,7 +677,6 @@ def page_analytics():
 
     st.markdown("---")
 
-    # 2) Team total production — previous 5 business days (one point per day)
     st.subheader("Team total production — previous 5 business days")
     biz_days = previous_business_days(5, today)
     s5, e5 = biz_days[0], biz_days[-1]
@@ -687,7 +706,6 @@ def page_analytics():
     fig1.update_layout(xaxis_title="Day", yaxis_title="Pieces")
     st.plotly_chart(fig1, use_container_width=True)
 
-    # 3) Monthly totals — last day of each month (one point per month)
     st.subheader("Monthly total production — month-end points (selected range)")
     df_month = fetch_df(
         """
@@ -714,15 +732,18 @@ def page_analytics():
 
     st.markdown("---")
 
-    # 4) Delete records
-    
-    # 4) Edit records (fix typos without deleting)
+    # =========================
+    # EDIT RECORDS
+    # =========================
     st.subheader("Edit a submission (fix typos)")
     st.caption("Select a record below, update fields, then save. Changes are permanent.")
 
     edit_df = df.copy()
     edit_df["entry_date"] = pd.to_datetime(edit_df["entry_date"]).dt.strftime("%Y-%m-%d")
-    edit_df = edit_df.sort_values(["entry_date", "employee", "work_type", "customer_name"], ascending=[False, True, True, True])
+    edit_df = edit_df.sort_values(
+        ["entry_date", "employee", "work_type", "customer_name"],
+        ascending=[False, True, True, True],
+    )
 
     labels_edit = [
         f'{r.entry_date} | {r.employee} | {r.work_type} | {r.customer_name} | hrs {float(r.hours_worked):g} | qty {int(r.actual_qty)}'
@@ -731,12 +752,10 @@ def page_analytics():
     pick_edit = st.selectbox("Select a row to edit", labels_edit, key="edit_pick")
     row = edit_df.iloc[labels_edit.index(pick_edit)]
 
-    # Editable fields
     c1, c2, c3, c4 = st.columns([1.2, 1.8, 1.0, 1.2])
     new_date = c1.date_input("Date", value=pd.to_datetime(row["entry_date"]).date(), format="MM/DD/YYYY", key="edit_date")
     new_work_type = c2.selectbox("Work type", WORK_TYPES, index=WORK_TYPES.index(row["work_type"]), key="edit_wt")
 
-    # Customer rules
     if new_work_type in ("Picking", "VAS"):
         new_customer = INTERNAL_CUSTOMER_NAME
         c3.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, disabled=True, key="edit_cust_disabled")
@@ -748,17 +767,13 @@ def page_analytics():
         new_customer = c3.selectbox("Customer", customer_list, index=customer_list.index(row["customer_name"]), key="edit_cust")
 
     new_hours = c4.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours_worked"]), step=0.25, key="edit_hours")
-
     label_edit = actual_label_for(new_work_type)
     new_actual = st.number_input(label_edit, min_value=0, value=int(row["actual_qty"]), step=10, key="edit_qty")
 
-    # Enforce sticker customer rule
     if new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS:
         st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
 
-    save_ok = True
-    if new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS:
-        save_ok = False
+    save_ok = not (new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS)
 
     if st.button("💾 Save changes", type="primary", disabled=not save_ok):
         new_expected = expected_qty(new_customer, new_work_type, float(new_hours))
@@ -788,15 +803,21 @@ def page_analytics():
 
     st.markdown("---")
 
-st.subheader("Delete a submission (fix typos)")
+    # =========================
+    # DELETE RECORDS (FIXED INDENT)
+    # =========================
+    st.subheader("Delete a submission (permanent)")
     st.caption("Use the table to find the record, then delete it below. This is permanent.")
 
     view_df = df.copy()
     view_df["entry_date"] = pd.to_datetime(view_df["entry_date"]).dt.strftime("%Y-%m-%d")
-    view_df = view_df.sort_values(["entry_date", "employee", "work_type", "customer_name"], ascending=[False, True, True, True])
+    view_df = view_df.sort_values(
+        ["entry_date", "employee", "work_type", "customer_name"],
+        ascending=[False, True, True, True],
+    )
 
     st.dataframe(
-        view_df[["entry_date","employee","work_type","customer_name","hours_worked","actual_qty","entry_id"]],
+        view_df[["entry_date", "employee", "work_type", "customer_name", "hours_worked", "actual_qty", "entry_id"]],
         use_container_width=True,
         hide_index=True,
     )
@@ -813,7 +834,6 @@ st.subheader("Delete a submission (fix typos)")
         exec_sql("DELETE FROM production_entries WHERE entry_id = :id::uuid", {"id": selected_id})
         st.success("Deleted ✅")
         st.rerun()
-
 
 def page_employees():
     st.title("Employees")
