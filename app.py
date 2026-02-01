@@ -39,7 +39,6 @@ VAS_RATE_PER_DAY = 400
 INTERNAL_CUSTOMER_NAME = "Internal (Picking/VAS)"
 
 # If you ever want to hide one employee from analytics, set it here (lowercase).
-# Leave as "" to hide nobody.
 HIDE_EMPLOYEE_FULLNAME_LOWER = ""  # e.g. "brandon bell"
 
 # Employees to seed
@@ -279,10 +278,7 @@ CUSTOMER_SEED = [
 ]
 
 # =============================================================================
-# DB (Neon / Postgres)
-# Streamlit secrets:
-# [connections.db]
-# url = "postgresql://..."
+# DB
 # =============================================================================
 @st.cache_resource
 def get_engine():
@@ -343,7 +339,6 @@ def init_db():
       ON production_entries(employee_id);
     """)
 
-    # enforce work_type constraint (idempotent)
     exec_sql("""
     DO $$
     BEGIN
@@ -387,6 +382,38 @@ def boot():
     init_db()
     seed_employees()
     seed_customers()
+
+# =============================================================================
+# CACHED LOOKUPS (speed!)
+# =============================================================================
+@st.cache_data(ttl=300)
+def get_active_employees_df() -> pd.DataFrame:
+    return fetch_df("""
+        SELECT employee_id::text AS employee_id, first_name, last_name
+        FROM employees
+        WHERE is_active = TRUE
+        ORDER BY first_name, last_name
+    """)
+
+@st.cache_data(ttl=300)
+def get_active_customers_df() -> pd.DataFrame:
+    return fetch_df(
+        """
+        SELECT customer_name
+        FROM customers
+        WHERE is_active = TRUE
+        ORDER BY
+          CASE
+            WHEN customer_name = 'Del Sol' THEN 1
+            WHEN customer_name = 'Cariloha' THEN 2
+            WHEN customer_name LIKE 'Purpose%' THEN 3
+            WHEN customer_name = :internal THEN 98
+            ELSE 99
+          END,
+          customer_name
+        """,
+        {"internal": INTERNAL_CUSTOMER_NAME},
+    )
 
 # =============================================================================
 # UI HELPERS
@@ -436,25 +463,6 @@ def previous_business_days(n: int, end_day: date | None = None) -> list[date]:
 def month_start(d: date) -> date:
     return d.replace(day=1)
 
-def get_active_customers_df() -> pd.DataFrame:
-    return fetch_df(
-        """
-        SELECT customer_name
-        FROM customers
-        WHERE is_active = TRUE
-        ORDER BY
-          CASE
-            WHEN customer_name = 'Del Sol' THEN 1
-            WHEN customer_name = 'Cariloha' THEN 2
-            WHEN customer_name LIKE 'Purpose%' THEN 3
-            WHEN customer_name = :internal THEN 98
-            ELSE 99
-          END,
-          customer_name
-        """,
-        {"internal": INTERNAL_CUSTOMER_NAME},
-    )
-
 def actual_label_for(work_type: str) -> str:
     if work_type == "Picking":
         return "Actual picks completed"
@@ -469,15 +477,9 @@ def actual_label_for(work_type: str) -> str:
 # =============================================================================
 def page_submissions():
     st.title("Submissions")
-    st.write("Log a shift (or partial shift). Add multiple lines for split shifts.")
+    st.write("Pick your name once. Add multiple lines if your day was split across work types/customers.")
 
-    emp_df = fetch_df("""
-        SELECT employee_id::text AS employee_id, first_name, last_name
-        FROM employees
-        WHERE is_active = TRUE
-        ORDER BY first_name, last_name
-    """)
-
+    emp_df = get_active_employees_df()
     cust_df = get_active_customers_df()
 
     if emp_df.empty:
@@ -491,88 +493,96 @@ def page_submissions():
     emp_label_to_id = dict(zip(emp_labels, emp_df["employee_id"].tolist()))
     customer_list = cust_df["customer_name"].tolist()
 
-    if "draft_rows" not in st.session_state:
-        st.session_state.draft_rows = [{
-            "entry_date": date.today(),
-            "employee_label": emp_labels[0],
+    # --- one-time header selections
+    top1, top2 = st.columns([1.4, 2.6])
+    default_employee = st.session_state.get("active_employee_label", emp_labels[0])
+    if default_employee not in emp_labels:
+        default_employee = emp_labels[0]
+
+    active_date = top1.date_input("Date", value=st.session_state.get("active_entry_date", date.today()), key="active_entry_date")
+    active_employee_label = top2.selectbox("Employee", emp_labels, index=emp_labels.index(default_employee), key="active_employee_label")
+
+    # initialize draft lines
+    if "draft_lines" not in st.session_state:
+        st.session_state.draft_lines = [{
             "work_type": "Tags",
-            "customer": customer_list[0],
+            "customer": "Del Sol" if "Del Sol" in customer_list else customer_list[0],
             "hours": 8.0,
             "actual": None,
         }]
 
-    def add_row():
-        last = st.session_state.draft_rows[-1]
-        st.session_state.draft_rows.append({
-            "entry_date": last["entry_date"],
-            "employee_label": last["employee_label"],
+    def add_line():
+        last = st.session_state.draft_lines[-1]
+        st.session_state.draft_lines.append({
             "work_type": last["work_type"],
             "customer": last["customer"],
             "hours": 4.0,
             "actual": None,
         })
 
-    def remove_row(i: int):
-        if len(st.session_state.draft_rows) <= 1:
+    def remove_line(i: int):
+        if len(st.session_state.draft_lines) <= 1:
             return
-        st.session_state.draft_rows.pop(i)
+        st.session_state.draft_lines.pop(i)
 
-    for i, row in enumerate(st.session_state.draft_rows):
-        st.markdown(f"### Entry {i+1}")
-        c1, c2, c3, c4, c5 = st.columns([1.1, 1.7, 1.3, 2.0, 1.2])
+    st.markdown("---")
 
-        row["entry_date"] = c1.date_input("Date", value=row["entry_date"], key=f"d_{i}")
-        row["employee_label"] = c2.selectbox("Employee", emp_labels, index=emp_labels.index(row["employee_label"]), key=f"e_{i}")
-        row["work_type"] = c3.selectbox("Work Type", WORK_TYPES, index=WORK_TYPES.index(row["work_type"]), key=f"wt_{i}")
+    for i, line in enumerate(st.session_state.draft_lines):
+        st.markdown(f"### Line {i+1}")
+        c1, c2, c3, c4 = st.columns([1.3, 2.4, 1.2, 2.1])
 
-        if row["work_type"] in ("Picking", "VAS"):
-            row["customer"] = INTERNAL_CUSTOMER_NAME
-            c4.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
+        line["work_type"] = c1.selectbox("Work Type", WORK_TYPES, index=WORK_TYPES.index(line["work_type"]), key=f"wt_{i}")
+
+        if line["work_type"] in ("Picking", "VAS"):
+            line["customer"] = INTERNAL_CUSTOMER_NAME
+            c2.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
         else:
-            if row["customer"] not in customer_list:
-                row["customer"] = customer_list[0]
-            row["customer"] = c4.selectbox("Customer", customer_list, index=customer_list.index(row["customer"]), key=f"c_{i}")
+            if line["customer"] not in customer_list:
+                line["customer"] = customer_list[0]
+            line["customer"] = c2.selectbox("Customer", customer_list, index=customer_list.index(line["customer"]), key=f"c_{i}")
 
-        row["hours"] = c5.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours"]), step=0.25, key=f"h_{i}")
+        line["hours"] = c3.number_input("Hours", min_value=0.25, max_value=12.0, value=float(line["hours"]), step=0.25, key=f"h_{i}")
 
-        exp = expected_qty(row["customer"], row["work_type"], float(row["hours"]))
-        default_actual = exp if row["actual"] is None else int(row["actual"])
-        label_actual = actual_label_for(row["work_type"])
-        row["actual"] = st.number_input(label_actual, min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
+        exp = expected_qty(line["customer"], line["work_type"], float(line["hours"]))
+        default_actual = exp if line["actual"] is None else int(line["actual"])
+        label_actual = actual_label_for(line["work_type"])
+        line["actual"] = c4.number_input(label_actual, min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
 
-        if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
+        if line["work_type"] == "Stickers" and line["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
 
-        eff = (row["actual"] / exp * 100.0) if exp > 0 else 0.0
+        eff = (line["actual"] / exp * 100.0) if exp > 0 else 0.0
         k1, k2, k3 = st.columns(3)
         k1.metric("Expected (prorated)", f"{exp:,}")
-        k2.metric("Actual", f"{int(row['actual']):,}")
+        k2.metric("Actual", f"{int(line['actual']):,}")
         k3.metric("Efficiency", f"{eff:.0f}%")
 
-        if len(st.session_state.draft_rows) > 1:
-            if st.button("🗑️ Remove this entry", key=f"rm_{i}"):
-                remove_row(i)
+        if len(st.session_state.draft_lines) > 1:
+            if st.button("🗑️ Remove this line", key=f"rm_{i}"):
+                remove_line(i)
                 st.rerun()
 
         st.markdown("---")
 
     b1, b2 = st.columns([1, 2])
-    if b1.button("➕ Add another submission", use_container_width=True):
-        add_row()
+    if b1.button("➕ Add another line", use_container_width=True):
+        add_line()
         st.rerun()
 
-    if b2.button("✅ Save ALL entries", use_container_width=True):
+    if b2.button("✅ Save submission", use_container_width=True):
         errors = []
-        for idx, r in enumerate(st.session_state.draft_rows, start=1):
+        for idx, r in enumerate(st.session_state.draft_lines, start=1):
             if float(r["hours"]) <= 0:
-                errors.append(f"Entry {idx}: Hours must be > 0.")
+                errors.append(f"Line {idx}: Hours must be > 0.")
             if r["work_type"] == "Stickers" and r["customer"] not in STICKER_ALLOWED_CUSTOMERS:
-                errors.append(f"Entry {idx}: Stickers only allowed for Del Sol and Cariloha.")
+                errors.append(f"Line {idx}: Stickers only allowed for Del Sol and Cariloha.")
         if errors:
             st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
-        for r in st.session_state.draft_rows:
+        employee_id = emp_label_to_id[active_employee_label]
+
+        for r in st.session_state.draft_lines:
             exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
             exec_sql(
                 """
@@ -584,8 +594,8 @@ def page_submissions():
                 """,
                 {
                     "id": str(uuid.uuid4()),
-                    "d": r["entry_date"],
-                    "eid": emp_label_to_id[r["employee_label"]],
+                    "d": active_date,
+                    "eid": employee_id,
                     "c": r["customer"],
                     "wt": r["work_type"],
                     "h": float(r["hours"]),
@@ -595,11 +605,10 @@ def page_submissions():
             )
 
         st.success("Saved ✅")
-        st.session_state.draft_rows = [{
-            "entry_date": date.today(),
-            "employee_label": emp_labels[0],
+        # reset lines only (keep employee + date selected for fast multiple submissions)
+        st.session_state.draft_lines = [{
             "work_type": "Tags",
-            "customer": customer_list[0],
+            "customer": "Del Sol" if "Del Sol" in customer_list else customer_list[0],
             "hours": 8.0,
             "actual": None,
         }]
@@ -705,106 +714,8 @@ def page_analytics():
     fig1.update_layout(xaxis_title="Day", yaxis_title="Pieces")
     st.plotly_chart(fig1, use_container_width=True)
 
-    st.subheader("Monthly total production — month-end points (selected range)")
-    df_month = fetch_df(
-        """
-        SELECT
-          (date_trunc('month', entry_date)::date + INTERVAL '1 month - 1 day')::date AS month_end,
-          SUM(actual_qty) AS total_actual
-        FROM production_entries
-        WHERE entry_date BETWEEN :s AND :e
-        GROUP BY month_end
-        ORDER BY month_end
-        """,
-        {"s": start, "e": end},
-    )
-
-    if df_month.empty:
-        st.info("No monthly totals for the selected range.")
-    else:
-        df_month["month_end"] = pd.to_datetime(df_month["month_end"]).dt.strftime("%Y-%m-%d")
-        df_month["total_actual"] = pd.to_numeric(df_month["total_actual"], errors="coerce").fillna(0).astype(int)
-
-        fig2 = px.line(df_month, x="month_end", y="total_actual", markers=True)
-        fig2.update_layout(xaxis_title="Month end", yaxis_title="Pieces")
-        st.plotly_chart(fig2, use_container_width=True)
-
     st.markdown("---")
 
-    # =========================
-    # EDIT RECORDS
-    # =========================
-    st.subheader("Edit a submission (fix typos)")
-    st.caption("Select a record below, update fields, then save. Changes are permanent.")
-
-    edit_df = df.copy()
-    edit_df["entry_date"] = pd.to_datetime(edit_df["entry_date"]).dt.strftime("%Y-%m-%d")
-    edit_df = edit_df.sort_values(
-        ["entry_date", "employee", "work_type", "customer_name"],
-        ascending=[False, True, True, True],
-    )
-
-    labels_edit = [
-        f'{r.entry_date} | {r.employee} | {r.work_type} | {r.customer_name} | hrs {float(r.hours_worked):g} | qty {int(r.actual_qty)}'
-        for r in edit_df.itertuples(index=False)
-    ]
-    pick_edit = st.selectbox("Select a row to edit", labels_edit, key="edit_pick")
-    row = edit_df.iloc[labels_edit.index(pick_edit)]
-
-    c1, c2, c3, c4 = st.columns([1.2, 1.8, 1.0, 1.2])
-    new_date = c1.date_input("Date", value=pd.to_datetime(row["entry_date"]).date(), format="MM/DD/YYYY", key="edit_date")
-    new_work_type = c2.selectbox("Work type", WORK_TYPES, index=WORK_TYPES.index(row["work_type"]), key="edit_wt")
-
-    if new_work_type in ("Picking", "VAS"):
-        new_customer = INTERNAL_CUSTOMER_NAME
-        c3.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, disabled=True, key="edit_cust_disabled")
-    else:
-        cust_df = get_active_customers_df()
-        customer_list = cust_df["customer_name"].tolist() if not cust_df.empty else [row["customer_name"]]
-        if row["customer_name"] not in customer_list:
-            customer_list = [row["customer_name"]] + customer_list
-        new_customer = c3.selectbox("Customer", customer_list, index=customer_list.index(row["customer_name"]), key="edit_cust")
-
-    new_hours = c4.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours_worked"]), step=0.25, key="edit_hours")
-    label_edit = actual_label_for(new_work_type)
-    new_actual = st.number_input(label_edit, min_value=0, value=int(row["actual_qty"]), step=10, key="edit_qty")
-
-    if new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS:
-        st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
-
-    save_ok = not (new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS)
-
-    if st.button("💾 Save changes", type="primary", disabled=not save_ok):
-        new_expected = expected_qty(new_customer, new_work_type, float(new_hours))
-        exec_sql(
-            """
-            UPDATE production_entries
-            SET entry_date = :d,
-                customer_name = :c,
-                work_type = :wt,
-                hours_worked = :h,
-                actual_qty = :a,
-                expected_qty = :e
-            WHERE entry_id = :id::uuid
-            """,
-            {
-                "d": new_date,
-                "c": new_customer,
-                "wt": new_work_type,
-                "h": float(new_hours),
-                "a": int(new_actual),
-                "e": int(new_expected),
-                "id": row["entry_id"],
-            },
-        )
-        st.success("Updated ✅")
-        st.rerun()
-
-    st.markdown("---")
-
-    # =========================
-    # DELETE RECORDS (FIXED INDENT)
-    # =========================
     st.subheader("Delete a submission (permanent)")
     st.caption("Use the table to find the record, then delete it below. This is permanent.")
 
@@ -837,6 +748,12 @@ def page_analytics():
 def page_employees():
     st.title("Employees")
 
+    # clear cache button (handy during changes)
+    if st.button("🔄 Refresh employee/customer cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared. Reloaded on next run.")
+        st.rerun()
+
     emp = fetch_df("""
         SELECT employee_id::text AS employee_id, first_name, last_name, is_active
         FROM employees
@@ -863,6 +780,7 @@ def page_employees():
                     """,
                     {"id": str(uuid.uuid4()), "fn": fn.strip(), "ln": ln.strip()},
                 )
+                st.cache_data.clear()
                 st.success("Added ✅")
                 st.rerun()
 
@@ -885,6 +803,7 @@ def page_employees():
                 """,
                 {"s": new_state, "id": selected["employee_id"]},
             )
+            st.cache_data.clear()
             st.success("Updated ✅")
             st.rerun()
 
@@ -927,6 +846,7 @@ def page_customers():
                     """,
                     {"id": str(uuid.uuid4()), "name": nm},
                 )
+                st.cache_data.clear()
                 st.success("Saved ✅")
                 st.rerun()
 
@@ -946,6 +866,7 @@ def page_customers():
                 """,
                 {"s": new_state, "id": selected["customer_id"]},
             )
+            st.cache_data.clear()
             st.success("Updated ✅")
             st.rerun()
 
