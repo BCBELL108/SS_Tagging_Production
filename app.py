@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 import plotly.express as px
 
 # =============================================================================
@@ -715,7 +715,80 @@ def page_analytics():
     st.markdown("---")
 
     # 4) Delete records
-    st.subheader("Delete a submission (fix typos)")
+    
+    # 4) Edit records (fix typos without deleting)
+    st.subheader("Edit a submission (fix typos)")
+    st.caption("Select a record below, update fields, then save. Changes are permanent.")
+
+    edit_df = df.copy()
+    edit_df["entry_date"] = pd.to_datetime(edit_df["entry_date"]).dt.strftime("%Y-%m-%d")
+    edit_df = edit_df.sort_values(["entry_date", "employee", "work_type", "customer_name"], ascending=[False, True, True, True])
+
+    labels_edit = [
+        f'{r.entry_date} | {r.employee} | {r.work_type} | {r.customer_name} | hrs {float(r.hours_worked):g} | qty {int(r.actual_qty)}'
+        for r in edit_df.itertuples(index=False)
+    ]
+    pick_edit = st.selectbox("Select a row to edit", labels_edit, key="edit_pick")
+    row = edit_df.iloc[labels_edit.index(pick_edit)]
+
+    # Editable fields
+    c1, c2, c3, c4 = st.columns([1.2, 1.8, 1.0, 1.2])
+    new_date = c1.date_input("Date", value=pd.to_datetime(row["entry_date"]).date(), format="MM/DD/YYYY", key="edit_date")
+    new_work_type = c2.selectbox("Work type", WORK_TYPES, index=WORK_TYPES.index(row["work_type"]), key="edit_wt")
+
+    # Customer rules
+    if new_work_type in ("Picking", "VAS"):
+        new_customer = INTERNAL_CUSTOMER_NAME
+        c3.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, disabled=True, key="edit_cust_disabled")
+    else:
+        cust_df = get_active_customers_df()
+        customer_list = cust_df["customer_name"].tolist() if not cust_df.empty else [row["customer_name"]]
+        if row["customer_name"] not in customer_list:
+            customer_list = [row["customer_name"]] + customer_list
+        new_customer = c3.selectbox("Customer", customer_list, index=customer_list.index(row["customer_name"]), key="edit_cust")
+
+    new_hours = c4.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours_worked"]), step=0.25, key="edit_hours")
+
+    label_edit = actual_label_for(new_work_type)
+    new_actual = st.number_input(label_edit, min_value=0, value=int(row["actual_qty"]), step=10, key="edit_qty")
+
+    # Enforce sticker customer rule
+    if new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS:
+        st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
+
+    save_ok = True
+    if new_work_type == "Stickers" and new_customer not in STICKER_ALLOWED_CUSTOMERS:
+        save_ok = False
+
+    if st.button("💾 Save changes", type="primary", disabled=not save_ok):
+        new_expected = expected_qty(new_customer, new_work_type, float(new_hours))
+        exec_sql(
+            """
+            UPDATE production_entries
+            SET entry_date = :d,
+                customer_name = :c,
+                work_type = :wt,
+                hours_worked = :h,
+                actual_qty = :a,
+                expected_qty = :e
+            WHERE entry_id = :id::uuid
+            """,
+            {
+                "d": new_date,
+                "c": new_customer,
+                "wt": new_work_type,
+                "h": float(new_hours),
+                "a": int(new_actual),
+                "e": int(new_expected),
+                "id": row["entry_id"],
+            },
+        )
+        st.success("Updated ✅")
+        st.rerun()
+
+    st.markdown("---")
+
+st.subheader("Delete a submission (fix typos)")
     st.caption("Use the table to find the record, then delete it below. This is permanent.")
 
     view_df = df.copy()
