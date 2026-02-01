@@ -38,7 +38,7 @@ VAS_RATE_PER_DAY = 400
 
 INTERNAL_CUSTOMER_NAME = "Internal (Picking/VAS)"
 
-# If you ever want to hide one employee from analytics (like "test user"), set it here (lowercase).
+# If you ever want to hide one employee from analytics, set it here (lowercase).
 # Leave as "" to hide nobody.
 HIDE_EMPLOYEE_FULLNAME_LOWER = ""  # e.g. "brandon bell"
 
@@ -280,7 +280,7 @@ CUSTOMER_SEED = [
 
 # =============================================================================
 # DB (Neon / Postgres)
-# Streamlit secrets should contain:
+# Streamlit secrets:
 # [connections.db]
 # url = "postgresql://..."
 # =============================================================================
@@ -290,7 +290,8 @@ def get_engine():
 
 def fetch_df(sql_obj, params: dict | None = None) -> pd.DataFrame:
     with get_engine().begin() as conn:
-        res = conn.execute(sql_obj if hasattr(sql_obj, "compile") else text(sql_obj), params or {})
+        stmt = sql_obj if hasattr(sql_obj, "compile") else text(sql_obj)
+        res = conn.execute(stmt, params or {})
         rows = res.mappings().all()
     return pd.DataFrame(rows)
 
@@ -402,7 +403,11 @@ def sidebar():
         if logo:
             st.image(logo, use_container_width=True)
         st.markdown("---")
-        page = st.radio("Navigate", ["Submissions", "Analytics", "Employees", "Customers"], label_visibility="collapsed")
+        page = st.radio(
+            "Navigate",
+            ["Submissions", "Analytics", "Employees", "Customers"],
+            label_visibility="collapsed",
+        )
         st.markdown("---")
         st.caption("Rates (per 8 hrs): Tags varies • Stickers 2400 • Picking 3000 • VAS 400")
     return page
@@ -494,7 +499,6 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": None,
-            "notes": "",
         }]
 
     def add_row():
@@ -506,7 +510,6 @@ def page_submissions():
             "customer": last["customer"],
             "hours": 4.0,
             "actual": None,
-            "notes": "",
         })
 
     def remove_row(i: int):
@@ -536,8 +539,6 @@ def page_submissions():
         default_actual = exp if row["actual"] is None else int(row["actual"])
         label_actual = actual_label_for(row["work_type"])
         row["actual"] = st.number_input(label_actual, min_value=0, value=int(default_actual), step=10, key=f"a_{i}")
-
-        row["notes"] = st.text_input("Notes (optional)", value=row.get("notes", ""), key=f"n_{i}")
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
@@ -577,9 +578,9 @@ def page_submissions():
                 """
                 INSERT INTO production_entries
                   (entry_id, entry_date, employee_id, customer_name, work_type,
-                   hours_worked, actual_qty, expected_qty, notes)
+                   hours_worked, actual_qty, expected_qty)
                 VALUES
-                  (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, :n)
+                  (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e)
                 """,
                 {
                     "id": str(uuid.uuid4()),
@@ -590,7 +591,6 @@ def page_submissions():
                     "h": float(r["hours"]),
                     "a": int(r["actual"]),
                     "e": int(exp),
-                    "n": (r.get("notes") or "").strip() or None,
                 },
             )
 
@@ -602,7 +602,6 @@ def page_submissions():
             "customer": customer_list[0],
             "hours": 8.0,
             "actual": None,
-            "notes": "",
         }]
         st.rerun()
 
