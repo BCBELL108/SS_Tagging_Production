@@ -543,73 +543,130 @@ def page_submissions():
         st.session_state.draft_rows.pop(i)
 
     for i, row in enumerate(st.session_state.draft_rows):
-        c1, c2, c3, c4, c5 = st.columns([1.35, 1.7, 1.3, 2.0, 1.0])
+        # Row 0 captures the "who/when" for the day.
+        # Additional rows are meant for split shifts / additional work and should NOT ask for employee again.
+        if i == 0:
+            c1, c2, c3, c4, c5 = st.columns([1.35, 1.7, 1.3, 2.0, 1.0])
 
-        row["entry_date"] = c1.date_input(
-            "Date",
-            value=row["entry_date"],
-            format="MM/DD/YYYY",
-            key=f"d_{i}",
-        )
-
-        row["employee_label"] = c2.selectbox(
-            "Employee",
-            emp_labels,
-            index=emp_labels.index(row["employee_label"]),
-            key=f"e_{i}",
-        )
-
-        row["work_type"] = c3.selectbox(
-            "Work Type",
-            WORK_TYPES,
-            index=WORK_TYPES.index(row["work_type"]),
-            key=f"wt_{i}",
-        )
-
-        if row["work_type"] in ("Picking", "VAS"):
-            row["customer"] = INTERNAL_CUSTOMER_NAME
-            c4.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
-        else:
-            if row["customer"] not in customer_list:
-                row["customer"] = customer_list[0]
-            row["customer"] = c4.selectbox(
-                "Customer",
-                customer_list,
-                index=customer_list.index(row["customer"]),
-                key=f"c_{i}",
+            # Calendar + forced format
+            row["entry_date"] = c1.date_input(
+                "Date",
+                value=row["entry_date"],
+                format="MM/DD/YYYY",
+                key=f"d_{i}",
             )
 
-        row["hours"] = c5.number_input(
-            "Hours",
-            min_value=0.25,
-            max_value=12.0,
-            value=float(row["hours"]),
-            step=0.25,
-            key=f"h_{i}",
-        )
+            row["employee_label"] = c2.selectbox(
+                "Employee",
+                emp_labels,
+                index=emp_labels.index(row["employee_label"]),
+                key=f"e_{i}",
+            )
 
+            row["work_type"] = c3.selectbox(
+                "Work type",
+                WORK_TYPES,
+                index=WORK_TYPES.index(row["work_type"]),
+                key=f"wt_{i}",
+            )
+
+            # Customer
+            if row["work_type"] in ("Picking", "VAS"):
+                row["customer"] = INTERNAL_CUSTOMER_NAME
+                c4.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
+            else:
+                if row["customer"] not in customer_list:
+                    row["customer"] = customer_list[0]
+                row["customer"] = c4.selectbox(
+                    "Customer",
+                    customer_list,
+                    index=customer_list.index(row["customer"]),
+                    key=f"c_{i}",
+                )
+
+            row["hours"] = c5.number_input(
+                "Hours",
+                min_value=0.25,
+                max_value=12.0,
+                value=float(row["hours"]),
+                step=0.25,
+                key=f"h_{i}",
+            )
+
+        else:
+            # Lock to the first row's date + employee
+            row["entry_date"] = st.session_state.draft_rows[0]["entry_date"]
+            row["employee_label"] = st.session_state.draft_rows[0]["employee_label"]
+
+            # For added rows: start with Work type -> Customer -> Hours -> Pieces
+            c1, c2, c3, c4, c5 = st.columns([1.3, 2.2, 1.0, 1.7, 0.8])
+
+            row["work_type"] = c1.selectbox(
+                "Work type",
+                WORK_TYPES,
+                index=WORK_TYPES.index(row["work_type"]),
+                key=f"wt_{i}",
+            )
+
+            if row["work_type"] in ("Picking", "VAS"):
+                row["customer"] = INTERNAL_CUSTOMER_NAME
+                c2.selectbox("Customer", [INTERNAL_CUSTOMER_NAME], index=0, key=f"c_{i}", disabled=True)
+            else:
+                if row["customer"] not in customer_list:
+                    row["customer"] = customer_list[0]
+                row["customer"] = c2.selectbox(
+                    "Customer",
+                    customer_list,
+                    index=customer_list.index(row["customer"]),
+                    key=f"c_{i}",
+                )
+
+            row["hours"] = c3.number_input(
+                "Hours",
+                min_value=0.25,
+                max_value=12.0,
+                value=float(row["hours"]),
+                step=0.25,
+                key=f"h_{i}",
+            )
+
+        # Pieces (label depends on work type)
         label = actual_label_for(row["work_type"])
-        row["actual"] = st.number_input(
-            label,
-            min_value=0,
-            value=int(row.get("actual", 0)),
-            step=10,
-            key=f"a_{i}",
-        )
 
-        row["notes"] = st.text_input(
-            "Notes (optional)",
-            value=row.get("notes", ""),
-            key=f"n_{i}",
-        )
+        if i == 0:
+            row["actual"] = st.number_input(
+                label,
+                min_value=0,
+                value=int(row.get("actual", 0)),
+                step=10,
+                key=f"a_{i}",
+            )
+            row["notes"] = st.text_input(
+                "Notes (optional)",
+                value=row.get("notes", ""),
+                key=f"n_{i}",
+            )
+        else:
+            row["actual"] = c4.number_input(
+                label,
+                min_value=0,
+                value=int(row.get("actual", 0)),
+                step=10,
+                key=f"a_{i}",
+            )
+            # Optional notes below the row (keeps the row compact)
+            row["notes"] = st.text_input(
+                "Notes (optional)",
+                value=row.get("notes", ""),
+                key=f"n_{i}",
+            )
+
+            if c5.button("🗑️ Remove", key=f"rm_{i}", use_container_width=True):
+                remove_row(i)
+                st.rerun()
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha**.")
-
-        if len(st.session_state.draft_rows) > 1:
-            if st.button("🗑️ Remove", key=f"rm_{i}"):
-                remove_row(i)
-                st.rerun()
 
         st.markdown("---")
 
