@@ -1,11 +1,12 @@
-\
-import streamlit as st
-import pandas as pd
-from datetime import date, datetime
-from sqlalchemy import text
-import plotly.express as px
+import os
+import uuid
+from pathlib import Path
+from datetime import date
 
-from db import get_engine, init_db, table_has_rows, seed_employees, seed_customers
+import pandas as pd
+import streamlit as st
+from sqlalchemy import create_engine, text
+import plotly.express as px
 
 # =============================================================================
 # CONFIG
@@ -17,7 +18,14 @@ st.set_page_config(
 )
 
 APP_TITLE = "Production Tracker"
-LOGO_PATH = "assets/silverscreen_logo.png"
+
+# Try these logo locations (works whether you keep it in repo root or /assets)
+LOGO_CANDIDATES = [
+    "assets/silverscreen_logo.png",
+    "assets/silverscreen_logo.PNG",
+    "silverscreen_logo.png",
+    "silverscreen_logo.PNG",
+]
 
 # Rates are per 8-hour shift
 TAG_RATES_PER_DAY = {
@@ -31,8 +39,6 @@ DEFAULT_TAG_RATE_PER_DAY = 800
 
 STICKER_ALLOWED_CUSTOMERS = {"Del Sol", "Cariloha"}
 STICKER_RATE_PER_DAY = 2400
-
-DAILY_TEAM_TAG_TARGET = 800  # overall tags target (team-level reference)
 
 # Seed data
 EMPLOYEE_SEED = [
@@ -57,7 +63,7 @@ CUSTOMER_SEED = [
     "Cariloha",
     "Purpose-Built PRO",
     "Purpose-Built Retail",
-    # Everything else
+    # Everything else (kept from your original list)
     "2469 - The UPS Store",
     "33.Black, LLC",
     "4M Promotions",
@@ -90,7 +96,6 @@ CUSTOMER_SEED = [
     "B&W Wholesale",
     "Calla Products, LLC",
     "Care Youth Corporation",
-    "Cariloha",
     "CDA Printing",
     "Classic Awards & Promotions",
     "Clayton AP Academy",
@@ -106,7 +111,6 @@ CUSTOMER_SEED = [
     "Creative Marketing and Design AIA",
     "CrossFreedom",
     "Defero Swag",
-    "Del Sol",
     "Deso Supply",
     "DFS West",
     "Divide Graphics",
@@ -196,8 +200,6 @@ CUSTOMER_SEED = [
     "PromoCentric LLC",
     "Promo Dog Inc",
     "Promotional Edge",
-    "Purpose-Built PRO",
-    "Purpose-Built Retail",
     "Qhik Moto",
     "Quantum Graphics, Inc.",
     "Radar Promotions",
@@ -271,40 +273,143 @@ CUSTOMER_SEED = [
 ]
 
 # =============================================================================
-# DB helpers
+# DB (Neon / Postgres)
 # =============================================================================
+def _get_database_url() -> str:
+    """
+    Preferred: set Streamlit secret DATABASE_URL or env var DATABASE_URL.
+    Neon provides a connection string that looks like:
+      postgresql://user:pass@host/dbname?sslmode=require
+    """
+    if "DATABASE_URL" in st.secrets:
+        return st.secrets["DATABASE_URL"]
+    env = os.getenv("DATABASE_URL")
+    if env:
+        return env
+    raise RuntimeError(
+        "DATABASE_URL not set. Add it to Streamlit secrets or as an environment variable."
+    )
+
 @st.cache_resource
-def _engine():
-    eng = get_engine()
-    init_db(eng)
-    # Seed on first run (tables exist, might be empty)
-    if not table_has_rows(eng, "employees"):
-        seed_employees(eng, EMPLOYEE_SEED)
-    if not table_has_rows(eng, "customers"):
-        seed_customers(eng, CUSTOMER_SEED)
-    return eng
+def get_engine():
+    db_url = _get_database_url()
+    # pool_pre_ping helps keep connections healthy on hosted Postgres
+    return create_engine(db_url, pool_pre_ping=True)
+
+def init_db():
+    sql = """
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+    CREATE TABLE IF NOT EXISTS employees (
+      employee_id uuid PRIMARY KEY,
+      first_name text NOT NULL,
+      last_name text NOT NULL,
+      is_active boolean NOT NULL DEFAULT TRUE,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS employees_name_uniq
+      ON employees (lower(first_name), lower(last_name));
+
+    CREATE TABLE IF NOT EXISTS customers (
+      customer_id uuid PRIMARY KEY,
+      customer_name text NOT NULL UNIQUE,
+      is_active boolean NOT NULL DEFAULT TRUE,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS production_entries (
+      entry_id uuid PRIMARY KEY,
+      entry_date date NOT NULL,
+      employee_id uuid NOT NULL REFERENCES employees(employee_id),
+      customer_name text NOT NULL,
+      work_type text NOT NULL CHECK (work_type IN ('Tags','Stickers')),
+      hours_worked numeric(5,2) NOT NULL CHECK (hours_worked > 0),
+      actual_qty integer NOT NULL CHECK (actual_qty >= 0),
+      expected_qty integer NOT NULL CHECK (expected_qty >= 0),
+      notes text NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS production_entries_date_idx
+      ON production_entries(entry_date);
+
+    CREATE INDEX IF NOT EXISTS production_entries_employee_idx
+      ON production_entries(employee_id);
+    """
+    with get_engine().begin() as conn:
+        conn.execute(text(sql))
 
 def fetch_df(sql: str, params: dict | None = None) -> pd.DataFrame:
-    with _engine().begin() as conn:
+    with get_engine().begin() as conn:
         res = conn.execute(text(sql), params or {})
         rows = res.mappings().all()
     return pd.DataFrame(rows)
 
 def exec_sql(sql: str, params: dict | None = None) -> None:
-    with _engine().begin() as conn:
+    with get_engine().begin() as conn:
         conn.execute(text(sql), params or {})
+
+def table_has_rows(table: str) -> bool:
+    df = fetch_df(f"SELECT 1 AS one FROM {table} LIMIT 1;")
+    return not df.empty
+
+def seed_employees():
+    if table_has_rows("employees"):
+        return
+    for r in EMPLOYEE_SEED:
+        exec_sql(
+            """
+            INSERT INTO employees (employee_id, first_name, last_name, is_active)
+            VALUES (:id, :fn, :ln, TRUE)
+            ON CONFLICT DO NOTHING
+            """,
+            {"id": str(uuid.uuid4()), "fn": r["first_name"], "ln": r["last_name"]},
+        )
+
+def seed_customers():
+    if table_has_rows("customers"):
+        return
+    for name in CUSTOMER_SEED:
+        exec_sql(
+            """
+            INSERT INTO customers (customer_id, customer_name, is_active)
+            VALUES (:id, :name, TRUE)
+            ON CONFLICT (customer_name) DO NOTHING
+            """,
+            {"id": str(uuid.uuid4()), "name": name},
+        )
+
+def boot():
+    init_db()
+    seed_employees()
+    seed_customers()
 
 # =============================================================================
 # UI helpers
 # =============================================================================
+def find_logo_path() -> str | None:
+    # Search relative to current working directory
+    for p in LOGO_CANDIDATES:
+        if Path(p).exists():
+            return p
+    return None
+
 def sidebar():
     with st.sidebar:
-        try:
-            st.image(LOGO_PATH, use_container_width=True)
-        except Exception:
-            st.write("**(Add logo at assets/silverscreen_logo.png)**")
+        logo = find_logo_path()
+        if logo:
+            st.image(logo, use_container_width=True)
+        else:
+            st.caption("Logo not found. Put it at repo root as `silverscreen_logo.png` or in `assets/`.")
         st.markdown("----")
-        page = st.radio("Navigate", ["Submissions", "Analytics", "Employees", "Customers"], label_visibility="collapsed")
+        page = st.radio(
+            "Navigate",
+            ["Submissions", "Analytics", "Employees", "Customers"],
+            label_visibility="collapsed",
+        )
         st.markdown("----")
         st.caption("🏷️ Tags target (team): 800/day • Stickers: 2400/day (Del Sol & Cariloha)")
     return page
@@ -325,7 +430,7 @@ def format_employee(row) -> str:
 # =============================================================================
 def page_submissions():
     st.title("Submissions")
-    st.write("Log a shift (or partial shift) for **Tags** or **Stickers**.")
+    st.write("Log a shift (or partial shift) for **Tags** or **Stickers**. Add multiple lines for split shifts.")
 
     emp_df = fetch_df("""
         SELECT employee_id::text AS employee_id, first_name, last_name
@@ -354,56 +459,168 @@ def page_submissions():
         st.error("No customers found in DB.")
         return
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        entry_date = st.date_input("Date", value=date.today())
-        emp_label_to_id = {format_employee(r): r["employee_id"] for _, r in emp_df.iterrows()}
-        employee_label = st.selectbox("Employee", list(emp_label_to_id.keys()))
-        work_type = st.radio("Work Type", ["Tags", "Stickers"], horizontal=True)
-    with colB:
-        customer = st.selectbox("Customer", cust_df["customer_name"].tolist())
-        hours = st.number_input("Hours worked", min_value=0.25, max_value=12.0, value=8.0, step=0.25)
-        if work_type == "Stickers" and customer not in STICKER_ALLOWED_CUSTOMERS:
+    emp_label_to_id = {format_employee(r): r["employee_id"] for _, r in emp_df.iterrows()}
+
+    # Session-state list of draft rows (split shifts)
+    if "draft_rows" not in st.session_state:
+        st.session_state.draft_rows = [
+            {
+                "entry_date": date.today(),
+                "employee_label": list(emp_label_to_id.keys())[0],
+                "work_type": "Tags",
+                "customer": cust_df["customer_name"].iloc[0],
+                "hours": 8.0,
+                "actual": None,
+                "notes": "",
+            }
+        ]
+
+    def add_row():
+        # Copy last row as a starting point
+        last = st.session_state.draft_rows[-1]
+        st.session_state.draft_rows.append(
+            {
+                "entry_date": last["entry_date"],
+                "employee_label": last["employee_label"],
+                "work_type": last["work_type"],
+                "customer": last["customer"],
+                "hours": 4.0,
+                "actual": None,
+                "notes": "",
+            }
+        )
+
+    def remove_row(i: int):
+        if len(st.session_state.draft_rows) <= 1:
+            return
+        st.session_state.draft_rows.pop(i)
+
+    # Render rows
+    st.subheader("New entries")
+    for i, row in enumerate(st.session_state.draft_rows):
+        st.markdown(f"**Entry {i+1}**")
+        c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.6, 1.2, 1.6, 1.2, 0.6])
+
+        row["entry_date"] = c1.date_input("Date", value=row["entry_date"], key=f"d_{i}")
+        row["employee_label"] = c2.selectbox(
+            "Employee",
+            list(emp_label_to_id.keys()),
+            index=list(emp_label_to_id.keys()).index(row["employee_label"]),
+            key=f"e_{i}",
+        )
+        row["work_type"] = c3.radio(
+            "Work Type",
+            ["Tags", "Stickers"],
+            horizontal=True,
+            index=0 if row["work_type"] == "Tags" else 1,
+            key=f"wt_{i}",
+        )
+        row["customer"] = c4.selectbox(
+            "Customer",
+            cust_df["customer_name"].tolist(),
+            index=cust_df["customer_name"].tolist().index(row["customer"]),
+            key=f"c_{i}",
+        )
+        row["hours"] = c5.number_input(
+            "Hours",
+            min_value=0.25,
+            max_value=12.0,
+            value=float(row["hours"]),
+            step=0.25,
+            key=f"h_{i}",
+        )
+
+        exp = expected_qty(row["customer"], row["work_type"], float(row["hours"]))
+        default_actual = exp if row["actual"] is None else int(row["actual"])
+        row["actual"] = st.number_input(
+            "Actual pieces completed",
+            min_value=0,
+            value=int(default_actual),
+            step=10,
+            key=f"a_{i}",
+        )
+        row["notes"] = st.text_input(
+            "Notes (optional)",
+            value=row.get("notes", ""),
+            placeholder="e.g., helped on setup, downtime, etc.",
+            key=f"n_{i}",
+        )
+
+        if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
             st.warning("Stickers are only allowed for **Del Sol** and **Cariloha** (per your standard).")
-        exp = expected_qty(customer, work_type, float(hours))
-        actual = st.number_input("Actual pieces completed", min_value=0, value=exp, step=10)
-        notes = st.text_input("Notes (optional)", placeholder="e.g., helped on setup, downtime, etc.")
 
-    # KPI preview
-    eff = (actual / exp * 100.0) if exp > 0 else 0.0
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Expected (prorated)", f"{exp:,}")
-    k2.metric("Actual", f"{actual:,}")
-    k3.metric("Efficiency", f"{eff:.0f}%")
+        eff = (row["actual"] / exp * 100.0) if exp > 0 else 0.0
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Expected (prorated)", f"{exp:,}")
+        k2.metric("Actual", f"{int(row['actual']):,}")
+        k3.metric("Efficiency", f"{eff:.0f}%")
 
-    submitted = st.button("✅ Submit", use_container_width=True)
+        # Row remove button
+        if len(st.session_state.draft_rows) > 1:
+            if st.button("🗑️ Remove this entry", key=f"rm_{i}"):
+                remove_row(i)
+                st.rerun()
 
-    if submitted:
-        if work_type == "Stickers" and customer not in STICKER_ALLOWED_CUSTOMERS:
-            st.error("Submission blocked: Stickers are only for Del Sol and Cariloha.")
+        st.markdown("---")
+
+    b1, b2 = st.columns([1, 2])
+    if b1.button("➕ Add another submission", use_container_width=True):
+        add_row()
+        st.rerun()
+
+    save_all = b2.button("✅ Save ALL entries", use_container_width=True)
+
+    if save_all:
+        # Validate
+        errors = []
+        for idx, r in enumerate(st.session_state.draft_rows, start=1):
+            if r["work_type"] == "Stickers" and r["customer"] not in STICKER_ALLOWED_CUSTOMERS:
+                errors.append(f"Entry {idx}: Stickers only allowed for Del Sol and Cariloha.")
+            if float(r["hours"]) <= 0:
+                errors.append(f"Entry {idx}: Hours must be > 0.")
+        if errors:
+            st.error("Fix these before saving:\n\n- " + "\n- ".join(errors))
             return
 
-        import uuid
-        exec_sql(
-            """
-            INSERT INTO production_entries
-              (entry_id, entry_date, employee_id, customer_name, work_type, hours_worked, actual_qty, expected_qty, notes)
-            VALUES
-              (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, :n)
-            """,
-            {
-                "id": str(uuid.uuid4()),
-                "d": entry_date,
-                "eid": emp_label_to_id[employee_label],
-                "c": customer,
-                "wt": work_type,
-                "h": float(hours),
-                "a": int(actual),
-                "e": int(exp),
-                "n": notes.strip() if notes else None,
-            },
-        )
+        # Insert
+        for r in st.session_state.draft_rows:
+            exp = expected_qty(r["customer"], r["work_type"], float(r["hours"]))
+            exec_sql(
+                """
+                INSERT INTO production_entries
+                  (entry_id, entry_date, employee_id, customer_name, work_type,
+                   hours_worked, actual_qty, expected_qty, notes)
+                VALUES
+                  (:id, :d, :eid::uuid, :c, :wt, :h, :a, :e, :n)
+                """,
+                {
+                    "id": str(uuid.uuid4()),
+                    "d": r["entry_date"],
+                    "eid": emp_label_to_id[r["employee_label"]],
+                    "c": r["customer"],
+                    "wt": r["work_type"],
+                    "h": float(r["hours"]),
+                    "a": int(r["actual"]),
+                    "e": int(exp),
+                    "n": r["notes"].strip() if r.get("notes") else None,
+                },
+            )
+
         st.success("Saved ✅")
+
+        # Reset to a single fresh row
+        st.session_state.draft_rows = [
+            {
+                "entry_date": date.today(),
+                "employee_label": list(emp_label_to_id.keys())[0],
+                "work_type": "Tags",
+                "customer": cust_df["customer_name"].iloc[0],
+                "hours": 8.0,
+                "actual": None,
+                "notes": "",
+            }
+        ]
+        st.rerun()
 
     st.markdown("### Recent entries (last 14 days)")
     recent = fetch_df("""
@@ -430,7 +647,6 @@ def page_submissions():
 
 def page_analytics():
     st.title("Analytics")
-
     st.write("Quick KPI view of production vs expected, by day, employee, and customer.")
 
     col1, col2, col3 = st.columns([1, 1, 2])
@@ -467,9 +683,8 @@ def page_analytics():
         st.info("No data in the selected range.")
         return
 
-    df["efficiency_pct"] = (df["actual_qty"] / df["expected_qty"]).replace([pd.NA, pd.NaT, float("inf")], 0) * 100
+    df["efficiency_pct"] = (df["actual_qty"] / df["expected_qty"]).replace([pd.NA, float("inf")], 0) * 100
 
-    # KPIs
     total_actual = int(df["actual_qty"].sum())
     total_expected = int(df["expected_qty"].sum())
     eff = (total_actual / total_expected * 100.0) if total_expected else 0.0
@@ -482,9 +697,8 @@ def page_analytics():
 
     st.markdown("----")
 
-    # Daily totals
     daily = df.groupby(["entry_date", "work_type"], as_index=False)[["actual_qty", "expected_qty"]].sum()
-    daily["efficiency_pct"] = (daily["actual_qty"] / daily["expected_qty"]).replace([pd.NA, pd.NaT, float("inf")], 0) * 100
+    daily["efficiency_pct"] = (daily["actual_qty"] / daily["expected_qty"]).replace([pd.NA, float("inf")], 0) * 100
 
     st.subheader("Daily totals")
     fig = px.line(daily, x="entry_date", y="actual_qty", color="work_type", markers=True)
@@ -493,10 +707,9 @@ def page_analytics():
     fig2 = px.line(daily, x="entry_date", y="expected_qty", color="work_type", markers=True)
     st.plotly_chart(fig2, use_container_width=True)
 
-    # Employee ranking
     st.subheader("Employee performance (Actual vs Expected)")
     emp = df.groupby("employee", as_index=False)[["actual_qty", "expected_qty"]].sum()
-    emp["efficiency_pct"] = (emp["actual_qty"] / emp["expected_qty"]).replace([pd.NA, pd.NaT, float("inf")], 0) * 100
+    emp["efficiency_pct"] = (emp["actual_qty"] / emp["expected_qty"]).replace([pd.NA, float("inf")], 0) * 100
     emp = emp.sort_values("efficiency_pct", ascending=False)
 
     fig3 = px.bar(emp, x="employee", y="efficiency_pct")
@@ -505,9 +718,13 @@ def page_analytics():
 
     st.dataframe(emp, use_container_width=True, hide_index=True)
 
-    # Customer mix
     st.subheader("Customer mix (Actual pieces)")
-    cust = df.groupby("customer_name", as_index=False)["actual_qty"].sum().sort_values("actual_qty", ascending=False).head(25)
+    cust = (
+        df.groupby("customer_name", as_index=False)["actual_qty"]
+        .sum()
+        .sort_values("actual_qty", ascending=False)
+        .head(25)
+    )
     fig4 = px.bar(cust, x="customer_name", y="actual_qty")
     fig4.update_layout(xaxis_title="", yaxis_title="Actual pieces")
     st.plotly_chart(fig4, use_container_width=True)
@@ -535,11 +752,11 @@ def page_employees():
             if not fn2 or not ln2:
                 st.error("Enter both first and last name.")
             else:
-                import uuid
                 exec_sql(
                     """
                     INSERT INTO employees (employee_id, first_name, last_name, is_active)
                     VALUES (:id, :fn, :ln, TRUE)
+                    ON CONFLICT DO NOTHING
                     """,
                     {"id": str(uuid.uuid4()), "fn": fn2, "ln": ln2},
                 )
@@ -548,8 +765,10 @@ def page_employees():
 
     with colB:
         st.subheader("Deactivate / Reactivate")
-        active_labels = [f"{r.first_name} {r.last_name} ({'Active' if r.is_active else 'Inactive'})"
-                         for r in emp.itertuples(index=False)]
+        active_labels = [
+            f"{r.first_name} {r.last_name} ({'Active' if r.is_active else 'Inactive'})"
+            for r in emp.itertuples(index=False)
+        ]
         pick = st.selectbox("Select employee", active_labels)
         selected = emp.iloc[active_labels.index(pick)]
         new_state = not bool(selected["is_active"])
@@ -573,7 +792,6 @@ def page_employees():
         exec_sql("DELETE FROM production_entries;")
         st.success("All entries deleted.")
         st.rerun()
-
 
 def page_customers():
     st.title("Customers")
@@ -607,7 +825,6 @@ def page_customers():
             if not nm:
                 st.error("Enter a customer name.")
             else:
-                import uuid
                 exec_sql(
                     """
                     INSERT INTO customers (customer_id, customer_name, is_active)
@@ -630,7 +847,6 @@ def page_customers():
             new_state = not bool(selected["is_active"])
             btn_label = "Deactivate" if selected["is_active"] else "Reactivate"
 
-            # guardrail: if trying to deactivate Del Sol/Cariloha/Purpose, warn
             if selected["customer_name"] in ("Del Sol", "Cariloha") or str(selected["customer_name"]).startswith("Purpose"):
                 st.warning("Heads up: this is a primary customer in your workflow.")
 
@@ -647,8 +863,16 @@ def page_customers():
                 st.rerun()
 
 # =============================================================================
-# Main router
+# Main
 # =============================================================================
+st.title(APP_TITLE)
+
+try:
+    boot()
+except Exception as e:
+    st.error(f"Database init failed: {e}")
+    st.stop()
+
 page = sidebar()
 
 if page == "Submissions":
