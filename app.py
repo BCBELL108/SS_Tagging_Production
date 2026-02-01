@@ -14,8 +14,6 @@ st.set_page_config(page_title="Production Tracker", page_icon="🏷️", layout=
 APP_TITLE = "Production Tracker"
 
 LOGO_CANDIDATES = [
-    "assets/silverscreen_logo.png",
-    "assets/silverscreen_logo.PNG",
     "silverscreen_logo.png",
     "silverscreen_logo.PNG",
 ]
