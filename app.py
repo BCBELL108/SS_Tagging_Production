@@ -1,6 +1,6 @@
 import uuid
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 import pandas as pd
 import streamlit as st
@@ -16,11 +16,14 @@ APP_TITLE = "Production Tracker"
 LOGO_CANDIDATES = [
     "silverscreen_logo.png",
     "silverscreen_logo.PNG",
+    "assets/silverscreen_logo.png",
+    "assets/silverscreen_logo.PNG",
 ]
 
 # Work types (rates are internal only; not shown in UI)
 WORK_TYPES = ["Tags", "Stickers", "Picking", "VAS"]
 
+# Internal production rates (per 8-hour shift) - NEVER displayed
 TAG_RATES_PER_DAY = {
     "Del Sol": 800,
     "Cariloha": 500,
@@ -340,7 +343,6 @@ def init_db():
       ON production_entries(employee_id);
     """)
 
-    # enforce work_type constraint (idempotent)
     exec_sql("""
     DO $$
     BEGIN
@@ -414,6 +416,7 @@ def sidebar():
     return page
 
 def expected_qty(customer: str, work_type: str, hours: float) -> int:
+    # internal only
     if work_type == "Tags":
         rate = TAG_RATES_PER_DAY.get(customer, DEFAULT_TAG_RATE_PER_DAY)
     elif work_type == "Stickers":
@@ -446,10 +449,22 @@ def actual_label_for(work_type: str) -> str:
         "Stickers": "Stickers adhered",
         "Picking": "Pieces picked",
         "VAS": "Pieces processed (VAS)",
-    }.get(work_type, "Actual pieces completed")
+    }.get(work_type, "Pieces completed")
+
+def mmddyyyy_input(label: str, value: date, key: str) -> date:
+    """
+    Text input that enforces MM/DD/YYYY display/entry.
+    Returns the prior value if parsing fails (and shows an error).
+    """
+    s = st.text_input(label, value.strftime("%m/%d/%Y"), key=key).strip()
+    try:
+        return datetime.strptime(s, "%m/%d/%Y").date()
+    except ValueError:
+        st.error(f"{label}: use MM/DD/YYYY (example: 02/01/2026)")
+        return value
 
 # =============================================================================
-# PAGES
+# CACHED LOOKUPS
 # =============================================================================
 @st.cache_data(ttl=30)
 def get_active_employees_df():
@@ -484,6 +499,9 @@ def get_active_customers_df():
         {"internal": INTERNAL_CUSTOMER_NAME},
     )
 
+# =============================================================================
+# PAGES
+# =============================================================================
 def page_submissions():
     st.title("Submissions")
     st.write('Log a shift (or partial shift). Use "Add another submission" for split shifts.')
@@ -509,19 +527,19 @@ def page_submissions():
             "work_type": "Tags",
             "customer": customer_list[0],
             "hours": 8.0,
-            "actual": 0,
+            "actual": 0,  # do not suggest
         }]
 
     def add_row():
-        # Keep the SAME employee + date automatically (your request)
+        # Always assume same employee + same date for split shifts
         last = st.session_state.draft_rows[-1]
         st.session_state.draft_rows.append({
             "entry_date": last["entry_date"],
-            "employee_label": last["employee_label"],  # assume same person
+            "employee_label": last["employee_label"],
             "work_type": last["work_type"],
             "customer": last["customer"],
             "hours": 4.0,
-            "actual": 0,  # do NOT suggest output
+            "actual": 0,  # do not suggest
         })
 
     def remove_row(i: int):
@@ -530,11 +548,24 @@ def page_submissions():
         st.session_state.draft_rows.pop(i)
 
     for i, row in enumerate(st.session_state.draft_rows):
-        c1, c2, c3, c4, c5 = st.columns([1.1, 1.7, 1.3, 2.0, 1.2])
+        c1, c2, c3, c4, c5 = st.columns([1.35, 1.7, 1.3, 2.0, 1.0])
 
-        row["entry_date"] = c1.date_input("Date", value=row["entry_date"], key=f"d_{i}")
-        row["employee_label"] = c2.selectbox("Employee", emp_labels, index=emp_labels.index(row["employee_label"]), key=f"e_{i}")
-        row["work_type"] = c3.selectbox("Work Type", WORK_TYPES, index=WORK_TYPES.index(row["work_type"]), key=f"wt_{i}")
+        with c1:
+            row["entry_date"] = mmddyyyy_input("Date", row["entry_date"], key=f"d_{i}")
+
+        row["employee_label"] = c2.selectbox(
+            "Employee",
+            emp_labels,
+            index=emp_labels.index(row["employee_label"]),
+            key=f"e_{i}",
+        )
+
+        row["work_type"] = c3.selectbox(
+            "Work Type",
+            WORK_TYPES,
+            index=WORK_TYPES.index(row["work_type"]),
+            key=f"wt_{i}",
+        )
 
         if row["work_type"] in ("Picking", "VAS"):
             row["customer"] = INTERNAL_CUSTOMER_NAME
@@ -542,18 +573,29 @@ def page_submissions():
         else:
             if row["customer"] not in customer_list:
                 row["customer"] = customer_list[0]
-            row["customer"] = c4.selectbox("Customer", customer_list, index=customer_list.index(row["customer"]), key=f"c_{i}")
+            row["customer"] = c4.selectbox(
+                "Customer",
+                customer_list,
+                index=customer_list.index(row["customer"]),
+                key=f"c_{i}",
+            )
 
-        row["hours"] = c5.number_input("Hours", min_value=0.25, max_value=12.0, value=float(row["hours"]), step=0.25, key=f"h_{i}")
+        row["hours"] = c5.number_input(
+            "Hours",
+            min_value=0.25,
+            max_value=12.0,
+            value=float(row["hours"]),
+            step=0.25,
+            key=f"h_{i}",
+        )
 
-        # Work-type specific label + no suggested value
         label = actual_label_for(row["work_type"])
         row["actual"] = st.number_input(
             label,
             min_value=0,
             value=int(row.get("actual", 0)),
             step=10,
-            key=f"a_{i}"
+            key=f"a_{i}",
         )
 
         if row["work_type"] == "Stickers" and row["customer"] not in STICKER_ALLOWED_CUSTOMERS:
@@ -625,11 +667,11 @@ def page_analytics():
     today = date.today()
     default_start = month_start(today)
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
     with c1:
-        start = st.date_input("Start", value=default_start)
+        start = mmddyyyy_input("Start", default_start, key="ana_start")
     with c2:
-        end = st.date_input("End", value=today)
+        end = mmddyyyy_input("End", today, key="ana_end")
     with c3:
         type_filter = st.multiselect("Work Types", WORK_TYPES, default=WORK_TYPES)
 
