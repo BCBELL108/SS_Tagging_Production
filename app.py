@@ -2,35 +2,18 @@
 # =============================================================================
 # SilverScreen Tagging Production Tracker (Streamlit + Neon/Postgres)
 #
-# GUARANTEED DB URL PICKUP:
-# - This version will automatically find your Neon URL from Streamlit Secrets
-#   even if the key isn't named db_url.
-# - It searches ALL secrets (including nested dicts) for the first string that
-#   looks like a Postgres connection URL.
+# FIXED: Reads Neon URL from Streamlit Secrets in THIS format:
+#   [connections.db]
+#   url = "postgresql://..."
 #
-# FEATURES (your requirements):
-# ✅ No optional notes/comments anywhere
-# ✅ Employee selects once (sidebar) — never re-asked
-# ✅ “ONE submission” per day = build a daily batch of line items, then submit once
-# ✅ Delete records: delete one line OR delete a whole batch
-# ✅ Rules enforced:
-#     - PICK only for Del Sol
-#     - TAG/STICKER for Del Sol + Cariloha
-#     - HANG TAGS for Del Sol + Cariloha + Purpose Built
-#     - VAS for all customers
-# ✅ Analytics:
-#     - last 5 business days: one point/day
-#     - monthly totals: one point/month
-# ✅ Speed:
-#     - cached engine + cached lookups
-#     - analytics uses aggregates (no full-table pulls)
-#
+# Also supports db_url / DATABASE_URL if present.
 # =============================================================================
 
 import os
 import uuid
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List
+from collections.abc import Mapping
 
 import pandas as pd
 import streamlit as st
@@ -48,7 +31,6 @@ TEAM_DAILY_TARGET = 800
 
 WORK_TYPES = ["Pick", "Tag/Sticker", "Hang Tags", "VAS"]
 
-# Only used if DB tables are empty
 DEFAULT_CUSTOMERS = ["Del Sol", "Cariloha", "Purpose Built"]
 DEFAULT_EMPLOYEES = [
     "Yesinia Alcala",
@@ -79,99 +61,84 @@ st.sidebar.title(APP_TITLE)
 
 
 # =============================================================================
-# DB URL RESOLUTION (AUTO-FIND FROM SECRETS)
+# DB URL (ROBUST + MATCHES YOUR SECRETS)
 # =============================================================================
 def _looks_like_postgres_url(s: str) -> bool:
-    if not s or not isinstance(s, str):
+    if not isinstance(s, str):
         return False
-    x = s.strip()
-    return (
-        x.startswith("postgresql://")
-        or x.startswith("postgres://")
-        or "neon.tech" in x
-    )
+    s = s.strip()
+    return s.startswith("postgresql://") or s.startswith("postgres://")
 
 
-def _flatten_values(obj: Any) -> List[Any]:
-    """Recursively collect values from nested dict/list structures."""
-    out: List[Any] = []
-    if isinstance(obj, dict):
-        for v in obj.values():
-            out.extend(_flatten_values(v))
-    elif isinstance(obj, (list, tuple)):
-        for v in obj:
-            out.extend(_flatten_values(v))
-    else:
-        out.append(obj)
-    return out
+def _get_nested(obj: Any, keys: List[str]) -> Any:
+    """
+    Safely get nested values from dict-like OR AttrDict-like objects.
+    """
+    cur = obj
+    for k in keys:
+        if cur is None:
+            return None
+        # Mapping (dict/AttrDict)
+        if isinstance(cur, Mapping) and k in cur:
+            cur = cur[k]
+            continue
+        # attribute-style
+        if hasattr(cur, k):
+            cur = getattr(cur, k)
+            continue
+        return None
+    return cur
 
 
-def _get_db_url_from_secrets_or_env() -> str:
-    # 1) Prefer explicit keys if present
-    preferred_keys = [
-        "db_url",
-        "DATABASE_URL",
-        "NEON_DATABASE_URL",
-        "POSTGRES_URL",
-        "POSTGRESQL_URL",
-    ]
-    for k in preferred_keys:
-        if k in st.secrets:
-            v = str(st.secrets[k]).strip()
-            if _looks_like_postgres_url(v):
-                return v
+def get_db_url() -> str:
+    # 1) Your exact Streamlit secret structure: [connections.db] url="..."
+    url = _get_nested(st.secrets, ["connections", "db", "url"])
+    if isinstance(url, str) and _looks_like_postgres_url(url):
+        return url.strip()
 
-    # 2) Streamlit "connections" style (common)
-    # e.g. [connections.postgresql] or similar
-    if "connections" in st.secrets:
-        vals = _flatten_values(st.secrets["connections"])
-        for v in vals:
-            if isinstance(v, str) and _looks_like_postgres_url(v.strip()):
-                return v.strip()
-
-    # 3) Search ALL secrets for any string that looks like a Postgres URL
-    vals = _flatten_values(dict(st.secrets))
-    for v in vals:
-        if isinstance(v, str) and _looks_like_postgres_url(v.strip()):
+    # 2) Common alternates (if you ever change later)
+    for key in ["db_url", "DATABASE_URL", "NEON_DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL"]:
+        v = st.secrets.get(key, None)
+        if isinstance(v, str) and _looks_like_postgres_url(v):
             return v.strip()
 
-    # 4) Fallback to env vars (local runs)
-    env_keys = ["DATABASE_URL", "NEON_DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL"]
-    for k in env_keys:
-        v = os.getenv(k)
-        if v and _looks_like_postgres_url(v.strip()):
+    # 3) Environment variables (local / backup)
+    for key in ["DATABASE_URL", "NEON_DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL"]:
+        v = os.getenv(key)
+        if isinstance(v, str) and _looks_like_postgres_url(v):
             return v.strip()
 
+    # If we got here, the secrets are present but not in a usable place
     raise RuntimeError(
-        "Could not find a Postgres/Neon database URL in Streamlit Secrets or env vars. "
-        "Your secrets exist, but none looked like a Postgres URL."
+        "Could not find a Postgres URL. Expected Streamlit secrets like:\n"
+        "[connections.db]\nurl = \"postgresql://...\""
     )
 
 
 @st.cache_resource(show_spinner=False)
 def get_engine():
-    db_url = _get_db_url_from_secrets_or_env()
-    return create_engine(
-        db_url,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
-    )
+    db_url = get_db_url()
+    return create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
 
+# Create engine with a clear UI error if it fails
 try:
     eng = get_engine()
 except Exception as e:
     st.error("Database connection is not configured correctly.")
     st.write("Error:", str(e))
     st.info(
-        "Your Neon URL must be present in Streamlit Secrets. "
-        "This app auto-detects it, but it must start with postgresql:// (or postgres://)."
+        "Your secrets should look like:\n\n"
+        "[connections.db]\n"
+        "url = \"postgresql://USER:PASSWORD@HOST/DB?sslmode=require\""
     )
     st.stop()
 
 
 def exec_sql(sql: str, params: Dict[str, Any] | None = None, *, fetch: bool = False):
+    """
+    Executes SQL with auto-commit. If it errors, show the real SQL + params.
+    """
     sql = sql.strip()
     try:
         with eng.begin() as conn:
@@ -180,7 +147,6 @@ def exec_sql(sql: str, params: Dict[str, Any] | None = None, *, fetch: bool = Fa
                 return res.mappings().all()
             return None
     except SQLAlchemyError as e:
-        # Show actual SQL + params so errors are no longer "redacted mystery"
         st.error("Database error while executing SQL.")
         st.code(sql, language="sql")
         if params:
@@ -327,7 +293,7 @@ if "selected_employee_name" not in st.session_state:
 if "daily_work_date" not in st.session_state:
     st.session_state.daily_work_date = date.today()
 if "daily_batch_lines" not in st.session_state:
-    st.session_state.daily_batch_lines = []  # list of dicts
+    st.session_state.daily_batch_lines = []
 
 
 # =============================================================================
@@ -370,7 +336,7 @@ def business_days_back(n: int, from_day: date) -> List[date]:
     days = []
     d = from_day
     while len(days) < n:
-        if d.weekday() < 5:  # Mon-Fri
+        if d.weekday() < 5:
             days.append(d)
         d -= timedelta(days=1)
     return sorted(days)
@@ -427,12 +393,7 @@ def page_submissions():
                 st.warning("Pieces must be greater than 0.")
             else:
                 st.session_state.daily_batch_lines.append(
-                    {
-                        "customer_id": cust_id,
-                        "customer_name": cust_name,
-                        "work_type": work_type,
-                        "pieces": int(pieces),
-                    }
+                    {"customer_id": cust_id, "customer_name": cust_name, "work_type": work_type, "pieces": int(pieces)}
                 )
                 st.success("Added.")
 
@@ -606,7 +567,6 @@ def page_analytics():
     l5_df["work_date"] = pd.to_datetime(l5_df["work_date"])
     l5_df["total_pieces"] = l5_df["total_pieces"].astype(int)
 
-    # ensure exactly one point per business day (fill missing as 0)
     idx = pd.to_datetime(pd.Series(last5))
     l5_df = l5_df.set_index("work_date").reindex(idx, fill_value=0).reset_index()
     l5_df.columns = ["work_date", "total_pieces"]
