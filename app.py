@@ -203,7 +203,7 @@ def page_submit():
         last = st.session_state.rows[-1]
         st.session_state.rows.append({
             "date": last["date"],
-            "emp": last["emp"],
+            "emp": last["emp"],  # Keep same employee
             "type": last["type"],
             "cust": last["cust"],
             "hrs": 4.0,
@@ -218,10 +218,18 @@ def page_submit():
     for i, r in enumerate(st.session_state.rows):
         st.markdown(f"### Line {i+1}")
         
-        c1, c2, c3 = st.columns(3)
-        r["date"] = c1.date_input("Date", r["date"], key=f"d{i}", max_value=date.today())
-        r["emp"] = c2.selectbox("Employee", emp_names, emp_names.index(r["emp"]), key=f"e{i}")
-        r["type"] = c3.selectbox("Type", WORK_TYPES, WORK_TYPES.index(r["type"]), key=f"t{i}")
+        # First line shows employee selector, others show it as disabled text
+        if i == 0:
+            c1, c2, c3 = st.columns(3)
+            r["date"] = c1.date_input("Date", r["date"], key=f"d{i}", max_value=date.today())
+            r["emp"] = c2.selectbox("Employee", emp_names, emp_names.index(r["emp"]), key=f"e{i}")
+            r["type"] = c3.selectbox("Type", WORK_TYPES, WORK_TYPES.index(r["type"]), key=f"t{i}")
+        else:
+            # Additional lines: lock employee to first line's selection
+            r["emp"] = st.session_state.rows[0]["emp"]
+            c1, c2 = st.columns(2)
+            r["date"] = c1.date_input("Date", r["date"], key=f"d{i}", max_value=date.today())
+            r["type"] = c2.selectbox("Type", WORK_TYPES, WORK_TYPES.index(r["type"]), key=f"t{i}")
 
         c1, c2 = st.columns(2)
         
@@ -328,6 +336,9 @@ def page_analytics():
         st.info("📭 No data")
         return
 
+    # Convert date to just date (remove time)
+    df['entry_date'] = pd.to_datetime(df['entry_date']).dt.date
+
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Entries", len(df))
@@ -341,19 +352,35 @@ def page_analytics():
 
     st.markdown("---")
 
+    # Charts by Work Type
+    st.markdown("### 📈 Production by Type")
+    
+    for work_type in WORK_TYPES:
+        df_type = df[df['work_type'] == work_type]
+        if not df_type.empty:
+            st.markdown(f"#### {work_type}")
+            
+            # Aggregate by date
+            daily = df_type.groupby('entry_date').agg({'actual_qty': 'sum'}).reset_index()
+            
+            fig = px.bar(
+                daily,
+                x='entry_date',
+                y='actual_qty',
+                title=f"{work_type} Production",
+                labels={'entry_date': 'Date', 'actual_qty': 'Quantity'}
+            )
+            fig.update_xaxes(type='category')  # Treat dates as categories for clean display
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
     # Top performers
     st.markdown("### 🏆 Top Performers")
     top = df.groupby("employee").agg({"actual_qty": "sum", "expected_qty": "sum"}).reset_index()
     top["efficiency"] = (top["actual_qty"] / top["expected_qty"] * 100).round(1)
     top = top.sort_values("efficiency", ascending=False).head(10)
     st.dataframe(top, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    # Chart
-    daily = df.groupby("entry_date").agg({"actual_qty": "sum", "expected_qty": "sum"}).reset_index()
-    fig = px.line(daily, x="entry_date", y=["actual_qty", "expected_qty"], title="Daily Production")
-    st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.dataframe(df, use_container_width=True, hide_index=True)
