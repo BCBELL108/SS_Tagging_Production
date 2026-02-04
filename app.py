@@ -338,6 +338,20 @@ def page_analytics():
 
     # Convert date to just date (remove time)
     df['entry_date'] = pd.to_datetime(df['entry_date']).dt.date
+    
+    # Create submission type column (combines work_type and customer for Tags)
+    def get_submission_type(row):
+        if row['work_type'] == 'Tags':
+            if 'Cariloha' in row['customer_name']:
+                return 'Cariloha Tags'
+            elif 'Del Sol' in row['customer_name']:
+                return 'Del Sol Tags'
+            else:
+                return 'Other Tags'
+        else:
+            return row['work_type']
+    
+    df['submission_type'] = df.apply(get_submission_type, axis=1)
 
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
@@ -352,8 +366,37 @@ def page_analytics():
 
     st.markdown("---")
 
-    # Charts by Work Type
-    st.markdown("### 📈 Production by Type")
+    # Top Performers with Submission Type Filter
+    st.markdown("### 🏆 Top Performers")
+    
+    # Get unique submission types
+    submission_types = ['All'] + sorted(df['submission_type'].unique().tolist())
+    
+    selected_type = st.selectbox(
+        "Filter by Submission Type",
+        submission_types,
+        help="Filter top performers by specific work type"
+    )
+    
+    # Filter data
+    if selected_type == 'All':
+        top_df = df.copy()
+    else:
+        top_df = df[df['submission_type'] == selected_type].copy()
+    
+    if not top_df.empty:
+        top = top_df.groupby("employee").agg({"actual_qty": "sum", "expected_qty": "sum"}).reset_index()
+        top["efficiency"] = (top["actual_qty"] / top["expected_qty"] * 100).round(1)
+        top = top.sort_values("efficiency", ascending=False).head(10)
+        top.columns = ['Employee', 'Total Pieces', 'Expected', 'Efficiency %']
+        st.dataframe(top, use_container_width=True, hide_index=True)
+    else:
+        st.info("No data for selected submission type")
+
+    st.markdown("---")
+
+    # Line Charts by Work Type
+    st.markdown("### 📈 Production Trends")
     
     for work_type in WORK_TYPES:
         df_type = df[df['work_type'] == work_type]
@@ -362,27 +405,24 @@ def page_analytics():
             
             # Aggregate by date
             daily = df_type.groupby('entry_date').agg({'actual_qty': 'sum'}).reset_index()
+            daily = daily.sort_values('entry_date')  # Ensure chronological order
             
-            fig = px.bar(
+            fig = px.line(
                 daily,
                 x='entry_date',
                 y='actual_qty',
-                title=f"{work_type} Production",
-                labels={'entry_date': 'Date', 'actual_qty': 'Quantity'}
+                title=f"{work_type} Production Over Time",
+                labels={'entry_date': 'Date', 'actual_qty': 'Quantity'},
+                markers=True  # Add dots at data points
             )
-            fig.update_xaxes(type='category')  # Treat dates as categories for clean display
+            fig.update_traces(line_color='#1f77b4', line_width=3)
+            fig.update_xaxes(type='category')
             st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
-
-    # Top performers
-    st.markdown("### 🏆 Top Performers")
-    top = df.groupby("employee").agg({"actual_qty": "sum", "expected_qty": "sum"}).reset_index()
-    top["efficiency"] = (top["actual_qty"] / top["expected_qty"] * 100).round(1)
-    top = top.sort_values("efficiency", ascending=False).head(10)
-    st.dataframe(top, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
+    
+    # Raw data table
+    st.markdown("### 📋 All Entries")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
