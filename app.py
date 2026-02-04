@@ -13,23 +13,22 @@ import plotly.express as px
 st.set_page_config(page_title="Production Tracker", page_icon="🏷️", layout="wide")
 
 LOGO_FILES = ["silverscreen_logo.png", "silverscreen_logo.PNG"]
-WORK_TYPES = ["Tags", "Stickers", "Picking", "VAS"]
+WORK_TYPES = ["Tags", "Stickers", "Picking"]
 
 # Rates per 8-hour shift
 TAG_RATES = {
     "Del Sol": 800,
-    "Cariloha": 500,
+    "Cariloha": 600,
     "Purpose Built": 600,
     "Purpose-Built PRO": 600,
     "Purpose-Built Retail": 600,
 }
-DEFAULT_TAG_RATE = 800
+DEFAULT_TAG_RATE = 600
 STICKER_RATE = 2400
 STICKER_CUSTOMERS = {"Del Sol", "Cariloha"}
 PICKING_RATE = 3000
-VAS_RATE = 400
 
-INTERNAL_CUSTOMER = "Internal (Picking/VAS)"
+INTERNAL_CUSTOMER = "Internal (Picking)"
 
 # Employee seed data
 EMPLOYEES = [
@@ -146,9 +145,9 @@ def sidebar_nav():
         if logo:
             st.image(logo, use_container_width=True)
         st.markdown("---")
-        page = st.radio("", ["📝 Submit", "📊 Analytics", "👥 Employees", "🏢 Customers"], label_visibility="collapsed")
+        page = st.radio("", ["📝 Submit", "📊 Analytics", "🗑️ Delete Entries", "👥 Employees", "🏢 Customers"], label_visibility="collapsed")
         st.markdown("---")
-        st.caption("**Rates (8hrs):** Tags: 500-800 • Stickers: 2400 • Picking: 3000 • VAS: 400")
+        st.caption("**Rates (8hrs):** Del Sol Tags: 800 • Cariloha Tags: 600 • Stickers: 2400 • Picking: 3000")
     return page
 
 def calc_expected(customer, work_type, hours):
@@ -156,10 +155,8 @@ def calc_expected(customer, work_type, hours):
         rate = TAG_RATES.get(customer, DEFAULT_TAG_RATE)
     elif work_type == "Stickers":
         rate = STICKER_RATE
-    elif work_type == "Picking":
+    else:  # Picking
         rate = PICKING_RATE
-    else:
-        rate = VAS_RATE
     return int(round(rate * (hours / 8.0)))
 
 # =============================================================================
@@ -233,7 +230,7 @@ def page_submit():
 
         c1, c2 = st.columns(2)
         
-        if r["type"] in ("Picking", "VAS"):
+        if r["type"] == "Picking":
             r["cust"] = INTERNAL_CUSTOMER
             c1.selectbox("Customer", [INTERNAL_CUSTOMER], 0, key=f"c{i}", disabled=True)
         else:
@@ -478,6 +475,88 @@ def page_customers():
                     st.error(f"❌ {e}")
 
 
+def page_delete():
+    st.title("🗑️ Delete Entries")
+    st.markdown("Search and delete production entries that were entered by mistake.")
+    
+    # Date range filter
+    col1, col2 = st.columns(2)
+    with col1:
+        start = st.date_input("Start Date", date.today() - timedelta(7))
+    with col2:
+        end = st.date_input("End Date", date.today())
+    
+    # Get entries
+    df = get_df("""
+        SELECT 
+            p.entry_id::text AS entry_id,
+            p.entry_date,
+            e.first_name || ' ' || e.last_name AS employee,
+            p.customer_name,
+            p.work_type,
+            p.hours_worked,
+            p.actual_qty,
+            p.expected_qty
+        FROM production_entries p
+        JOIN employees e ON p.employee_id = e.employee_id
+        WHERE p.entry_date BETWEEN :s AND :e
+        ORDER BY p.entry_date DESC, e.first_name
+    """, {"s": start, "e": end})
+    
+    if df.empty:
+        st.info("📭 No entries found in this date range")
+        return
+    
+    st.markdown(f"### Found {len(df)} entries")
+    
+    # Search/filter
+    col1, col2 = st.columns(2)
+    with col1:
+        search_employee = st.text_input("🔍 Search by Employee Name", placeholder="e.g., John")
+    with col2:
+        filter_type = st.selectbox("Filter by Type", ["All"] + WORK_TYPES)
+    
+    # Apply filters
+    filtered = df.copy()
+    if search_employee:
+        filtered = filtered[filtered['employee'].str.contains(search_employee, case=False)]
+    if filter_type != "All":
+        filtered = filtered[filtered['work_type'] == filter_type]
+    
+    if filtered.empty:
+        st.warning("No entries match your filters")
+        return
+    
+    st.markdown(f"**Showing {len(filtered)} entries**")
+    
+    # Display entries with delete buttons
+    for idx, row in filtered.iterrows():
+        with st.container():
+            col1, col2, col3, col4, col5, col6 = st.columns([2, 1.5, 1.5, 1, 1, 1])
+            
+            col1.write(f"**{row['employee']}**")
+            col2.write(f"{row['entry_date']}")
+            col3.write(f"{row['customer_name'][:20]}...")
+            col4.write(f"{row['work_type']}")
+            col5.write(f"{row['actual_qty']} pcs")
+            
+            if col6.button("🗑️ Delete", key=f"del_{row['entry_id']}", type="secondary"):
+                # Confirm delete
+                if st.session_state.get(f"confirm_{row['entry_id']}", False):
+                    try:
+                        run_sql("DELETE FROM production_entries WHERE entry_id = :id", {"id": row['entry_id']})
+                        st.success(f"✅ Deleted entry for {row['employee']}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Error: {e}")
+                else:
+                    st.session_state[f"confirm_{row['entry_id']}"] = True
+                    st.warning(f"⚠️ Click 'Delete' again to confirm removal of {row['employee']}'s entry")
+                    st.rerun()
+            
+            st.markdown("---")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -494,6 +573,8 @@ def main():
         page_submit()
     elif page == "📊 Analytics":
         page_analytics()
+    elif page == "🗑️ Delete Entries":
+        page_delete()
     elif page == "👥 Employees":
         page_employees()
     elif page == "🏢 Customers":
